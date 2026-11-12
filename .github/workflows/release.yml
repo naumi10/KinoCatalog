@@ -15,12 +15,12 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact_name: myMovies.exe
-            release_archive: myMovies-windows-x64.zip
+            artifact_name: KinoCatalog.exe
+            release_archive: KinoCatalog-windows-x64.zip
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact_name: myMovies
-            release_archive: myMovies-linux-x64.tar.gz
+            artifact_name: KinoCatalog
+            release_archive: KinoCatalog-linux-x64.tar.gz
 
 
 
@@ -55,10 +55,19 @@ jobs:
       - name: Package Linux Asset
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # Copy your linux icon file to the release directory before compressing
-          cp assets/myMovies.png target/${{ matrix.target }}/release/ 
-          cd target/${{ matrix.target }}/release
-          tar -czf ../../../${{ matrix.release_archive }} ${{ matrix.artifact_name }} myMovies.png
+          # Stage the release files under a single directory in the archive.
+          # Keep the staging directory outside target/release, because the
+          # compiled binary itself is named "KinoCatalog" there.
+          package_dir="$RUNNER_TEMP/KinoCatalog"
+          rm -rf "$package_dir"
+          mkdir -p "$package_dir"
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "$package_dir/"
+          cp assets/KinoCatalog.png install.sh "$package_dir/"
+
+          # Ensure the install script has execution permissions before archiving
+          chmod +x "$package_dir/install.sh"
+
+          tar -czf "${{ matrix.release_archive }}" -C "$RUNNER_TEMP" KinoCatalog
 
       - name: Upload Artifacts to GitHub Release
         uses: softprops/action-gh-release@v2

@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::model::{Actor, Movie, join_list};
+use crate::model::{Actor, Movie, join_list, normalize_country};
 
 const BASE_URL: &str = "https://www.omdbapi.com/";
-const USER_AGENT: &str = concat!("myMovies/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("KinoCatalog/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT_SECONDS: u64 = 20;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -16,6 +16,7 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Year,
+    AlternativeTitles,
     Genres,
     Directors,
     Writers,
@@ -29,6 +30,7 @@ impl Field {
     pub fn label(self) -> &'static str {
         match self {
             Self::Year => "Year",
+            Self::AlternativeTitles => "Alternative titles",
             Self::Genres => "Genres",
             Self::Directors => "Directors",
             Self::Writers => "Writers",
@@ -51,6 +53,9 @@ pub struct Details {
     pub actors: Vec<String>,
     pub plot: String,
     pub country: String,
+    /// Additional titles reported by providers such as TMDB. OMDb leaves this
+    /// empty because its response has no equivalent field.
+    pub alternative_titles: Vec<String>,
 }
 
 /// One field in the comparison dialog.
@@ -74,6 +79,14 @@ impl Details {
                 Field::Year,
                 String::new(),
                 self.year.map(|year| year.to_string()).unwrap_or_default(),
+            ));
+        }
+
+        if !self.alternative_titles.is_empty() {
+            rows.push((
+                Field::AlternativeTitles,
+                join_list(&movie.alternative_titles),
+                join_list(&self.alternative_titles),
             ));
         }
 
@@ -105,7 +118,11 @@ impl Details {
                 join_list(&self.actors),
             ),
             (Field::Overview, movie.overview.clone(), self.plot.clone()),
-            (Field::Country, movie.country.clone(), self.country.clone()),
+            (
+                Field::Country,
+                normalize_country(&movie.country),
+                normalize_country(&self.country),
+            ),
             (Field::ImdbId, movie.imdb_id.clone(), self.imdb_id.clone()),
         ]);
 
@@ -128,6 +145,9 @@ impl Details {
         for field in fields {
             match field {
                 Field::Year => movie.year = self.year,
+                Field::AlternativeTitles => {
+                    movie.alternative_titles = self.alternative_titles.clone()
+                }
                 Field::Genres => movie.genres = self.genres.clone(),
                 Field::Directors => movie.directors = self.directors.clone(),
                 Field::Writers => movie.writers = self.writers.clone(),
@@ -146,7 +166,7 @@ impl Details {
                         .collect();
                 }
                 Field::Overview => movie.overview = self.plot.clone(),
-                Field::Country => movie.country = self.country.clone(),
+                Field::Country => movie.country = normalize_country(&self.country),
                 Field::ImdbId => movie.imdb_id = self.imdb_id.clone(),
             }
         }
@@ -237,7 +257,8 @@ fn details_from_json(value: &Value) -> Details {
         writers: list(value, "Writer"),
         actors: list(value, "Actors"),
         plot: text(value, "Plot").unwrap_or_default(),
-        country: text(value, "Country").unwrap_or_default(),
+        country: normalize_country(&text(value, "Country").unwrap_or_default()),
+        alternative_titles: Vec::new(),
     }
 }
 
@@ -307,6 +328,31 @@ mod tests {
         );
         assert_eq!(details.country, "United States");
         assert!(details.plot.starts_with("A young F.B.I."));
+    }
+
+    #[test]
+    fn normalizes_united_states_of_america() {
+        let details = details_from_json(&serde_json::json!({
+            "Country": "United States of America",
+            "Response": "True"
+        }));
+        assert_eq!(details.country, "United States");
+
+        let mut movie = Movie {
+            country: "United States of America".to_string(),
+            ..Default::default()
+        };
+        let changes = details.changes(&movie);
+        let country = changes
+            .iter()
+            .find(|change| change.field == Field::Country)
+            .unwrap();
+        assert!(!country.selected);
+        assert_eq!(country.current, "United States");
+        assert_eq!(country.incoming, "United States");
+
+        details.apply(&mut movie, [Field::Country].into_iter());
+        assert_eq!(movie.country, "United States");
     }
 
     #[test]
@@ -429,6 +475,45 @@ mod tests {
             .find(|change| change.field == Field::ImdbId)
             .unwrap();
         assert!(imdb.selected);
+    }
+
+    #[test]
+    fn offers_alternative_titles_when_the_provider_has_them() {
+        let mut details = details_from_json(&sample_json());
+        assert!(
+            details
+                .changes(&Movie::default())
+                .iter()
+                .all(|change| change.field != Field::AlternativeTitles)
+        );
+
+        details.alternative_titles = vec![
+            "Das Schweigen der Lämmer".to_string(),
+            "Le silence des agneaux".to_string(),
+        ];
+        let mut movie = Movie {
+            title: "The Silence of the Lambs".to_string(),
+            ..Default::default()
+        };
+        let changes = details.changes(&movie);
+        let alternative = changes
+            .iter()
+            .find(|change| change.field == Field::AlternativeTitles)
+            .expect("TMDB alternative titles should be offered");
+        assert!(alternative.selected);
+        assert_eq!(
+            alternative.incoming,
+            "Das Schweigen der Lämmer, Le silence des agneaux"
+        );
+
+        details.apply(&mut movie, [Field::AlternativeTitles].into_iter());
+        assert_eq!(
+            movie.alternative_titles,
+            vec![
+                "Das Schweigen der Lämmer".to_string(),
+                "Le silence des agneaux".to_string()
+            ]
+        );
     }
 
     #[test]

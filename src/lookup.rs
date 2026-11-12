@@ -7,7 +7,7 @@ use encoding_rs::{Encoding, WINDOWS_1252};
 use flate2::read::ZlibDecoder;
 
 use crate::covers;
-use crate::model::{DiscFormat, sort_title_for};
+use crate::model::{Actor, DiscFormat, Movie, join_list, sort_title_for};
 
 const BASE_URL: &str = "http://www.invelos.com";
 const REDIRECTS_URL: &str = "http://www.invelos.com/AppData/DVDPro/redirects.inv";
@@ -61,13 +61,209 @@ pub struct ProfileSummary {
     pub edition: String,
 }
 
+/// One profile field that an Invelos update can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Title,
+    OriginalTitle,
+    SortTitle,
+    Format,
+    Year,
+    Runtime,
+    Rating,
+    Directors,
+    Cast,
+    Synopsis,
+    Upc,
+    Locality,
+}
+
+impl Field {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::OriginalTitle => "Original title",
+            Self::SortTitle => "Sort title",
+            Self::Format => "Format",
+            Self::Year => "Year",
+            Self::Runtime => "Runtime",
+            Self::Rating => "Rating",
+            Self::Directors => "Directors",
+            Self::Cast => "Cast",
+            Self::Synopsis => "Synopsis",
+            Self::Upc => "UPC",
+            Self::Locality => "Locality",
+        }
+    }
+}
+
+/// One field in the Invelos comparison dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub field: Field,
+    pub label: &'static str,
+    pub current: String,
+    pub incoming: String,
+    pub selected: bool,
+}
+
+impl MovieDetails {
+    /// Builds the comparison rows between a movie and an Invelos profile.
+    /// Fields that are empty in the profile are not selected; changed values
+    /// are selected by default.
+    pub fn changes(&self, movie: &Movie) -> Vec<Change> {
+        let rows = vec![
+            (Field::Title, movie.title.clone(), self.title.clone()),
+            (
+                Field::OriginalTitle,
+                movie.original_title.clone(),
+                self.original_title.clone(),
+            ),
+            (
+                Field::SortTitle,
+                movie.sort_title.clone(),
+                self.sort_title.clone(),
+            ),
+            (
+                Field::Format,
+                movie.format.label().to_string(),
+                self.format.label().to_string(),
+            ),
+            (
+                Field::Year,
+                movie
+                    .year
+                    .filter(|year| *year > 0)
+                    .map(|year| year.to_string())
+                    .unwrap_or_default(),
+                self.year.map(|year| year.to_string()).unwrap_or_default(),
+            ),
+            (
+                Field::Runtime,
+                runtime_label(movie.runtime_minutes),
+                runtime_label(self.runtime_minutes),
+            ),
+            (Field::Rating, movie.rating.clone(), self.rating.clone()),
+            (
+                Field::Directors,
+                join_list(&movie.directors),
+                join_list(&self.directors),
+            ),
+            (
+                Field::Cast,
+                cast_label(
+                    movie
+                        .actors
+                        .iter()
+                        .map(|actor| (actor.name.as_str(), actor.role.as_str())),
+                ),
+                cast_label(
+                    self.cast
+                        .iter()
+                        .map(|(name, role)| (name.as_str(), role.as_str())),
+                ),
+            ),
+            (
+                Field::Synopsis,
+                movie.overview.clone(),
+                self.synopsis.clone(),
+            ),
+            (Field::Upc, movie.upc.clone(), self.upc.clone()),
+            (
+                Field::Locality,
+                movie.locality.clone(),
+                self.locality.clone(),
+            ),
+        ];
+
+        rows.into_iter()
+            .map(|(field, current, incoming)| {
+                let current_empty = current.trim().is_empty();
+                Change {
+                    field,
+                    label: field.label(),
+                    selected: !incoming.trim().is_empty() && (current_empty || incoming != current),
+                    current,
+                    incoming,
+                }
+            })
+            .collect()
+    }
+
+    /// Applies the selected fields to a movie.
+    pub fn apply(&self, movie: &mut Movie, fields: impl Iterator<Item = Field>) {
+        for field in fields {
+            match field {
+                Field::Title => movie.title = self.title.clone(),
+                Field::OriginalTitle => movie.original_title = self.original_title.clone(),
+                Field::SortTitle => movie.sort_title = self.sort_title.clone(),
+                Field::Format => movie.format = self.format,
+                Field::Year => movie.year = self.year,
+                Field::Runtime => movie.runtime_minutes = self.runtime_minutes,
+                Field::Rating => movie.rating = self.rating.clone(),
+                Field::Directors => movie.directors = self.directors.clone(),
+                Field::Cast => {
+                    let previous = std::mem::take(&mut movie.actors);
+                    movie.actors = self
+                        .cast
+                        .iter()
+                        .map(|(name, role)| {
+                            previous
+                                .iter()
+                                .find(|actor| actor.name.eq_ignore_ascii_case(name))
+                                .cloned()
+                                .map(|mut actor| {
+                                    actor.role = role.clone();
+                                    actor
+                                })
+                                .unwrap_or_else(|| Actor::new(name.clone(), role.clone()))
+                        })
+                        .collect();
+                }
+                Field::Synopsis => movie.overview = self.synopsis.clone(),
+                Field::Upc => movie.upc = self.upc.clone(),
+                Field::Locality => movie.locality = self.locality.clone(),
+            }
+        }
+    }
+}
+
+fn runtime_label(minutes: Option<u32>) -> String {
+    match minutes {
+        Some(minutes) if minutes >= 60 => {
+            let (hours, rest) = (minutes / 60, minutes % 60);
+            if rest == 0 {
+                format!("{hours} h")
+            } else {
+                format!("{hours} h {rest} min")
+            }
+        }
+        Some(minutes) => format!("{minutes} min"),
+        None => String::new(),
+    }
+}
+
+fn cast_label<'a>(cast: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    cast.map(|(name, role)| {
+        let role = role.trim();
+        if role.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} as {role}")
+        }
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 /// The preferred Invelos locality. Finland is 16.
 ///
 /// This is only a preference: when a barcode has profiles in several
 /// localities the Add dialog lets the user choose instead of fetching this one
 /// blindly.
 pub fn locality() -> String {
-    std::env::var("MYMOVIES_LOCALITY")
+    std::env::var("KINOCATALOG_LOCALITY")
+        .or_else(|_| std::env::var("MYMOVIES_LOCALITY"))
         .ok()
         .and_then(|value| normalize_locality(&value).ok())
         .unwrap_or_else(|| "16".to_string())
@@ -1469,7 +1665,148 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    #[test]
+    fn compares_invelos_profile_with_a_movie() {
+        let details = MovieDetails {
+            upc: "044007867020".to_string(),
+            profile_id: "044007867020.16".to_string(),
+            locality: "Finland".to_string(),
+            title: "Ihmissusi Lontoossa".to_string(),
+            original_title: "An American Werewolf in London".to_string(),
+            sort_title: "Ihmissusi Lontoossa".to_string(),
+            format: DiscFormat::BluRay,
+            year: Some(1981),
+            runtime_minutes: Some(93),
+            rating: "18".to_string(),
+            directors: vec!["John Landis".to_string()],
+            cast: vec![
+                ("David Naughton".to_string(), "David Kessler".to_string()),
+                ("Jenny Agutter".to_string(), "Nurse Alex Price".to_string()),
+            ],
+            synopsis: "Two backpackers' trip goes wrong.".to_string(),
+            front_cover: false,
+            back_cover: false,
+        };
+        let movie = Movie {
+            id: "1".to_string(),
+            title: "An American Werewolf in London".to_string(),
+            original_title: "An American Werewolf in London".to_string(),
+            sort_title: "American Werewolf in London, An".to_string(),
+            format: DiscFormat::Dvd,
+            year: None,
+            runtime_minutes: None,
+            rating: String::new(),
+            actors: vec![Actor::new("David Naughton", "David Kessler")],
+            upc: "044007867020".to_string(),
+            locality: "United States".to_string(),
+            ..Default::default()
+        };
+
+        let changes = details.changes(&movie);
+        let by_field = |field: Field| changes.iter().find(|change| change.field == field).unwrap();
+
+        assert_eq!(
+            by_field(Field::Title).current,
+            "An American Werewolf in London"
+        );
+        assert_eq!(by_field(Field::Title).incoming, "Ihmissusi Lontoossa");
+        assert!(by_field(Field::Title).selected);
+        assert!(!by_field(Field::OriginalTitle).selected);
+        assert!(by_field(Field::SortTitle).selected);
+        assert_eq!(by_field(Field::Format).incoming, "Blu-ray");
+        assert!(by_field(Field::Format).selected);
+        assert_eq!(by_field(Field::Year).incoming, "1981");
+        assert!(by_field(Field::Year).selected);
+        assert_eq!(by_field(Field::Runtime).incoming, "1 h 33 min");
+        assert_eq!(by_field(Field::Directors).incoming, "John Landis");
+        assert_eq!(
+            by_field(Field::Cast).incoming,
+            "David Naughton as David Kessler, Jenny Agutter as Nurse Alex Price"
+        );
+        assert!(by_field(Field::Cast).selected);
+        assert!(!by_field(Field::Upc).selected);
+        assert_eq!(by_field(Field::Locality).incoming, "Finland");
+        assert!(by_field(Field::Locality).selected);
+    }
+
+    #[test]
+    fn applies_selected_invelos_fields() {
+        let details = MovieDetails {
+            upc: "044007867020".to_string(),
+            profile_id: "044007867020.16".to_string(),
+            locality: "Finland".to_string(),
+            title: "Ihmissusi Lontoossa".to_string(),
+            original_title: "An American Werewolf in London".to_string(),
+            sort_title: "Ihmissusi Lontoossa".to_string(),
+            format: DiscFormat::BluRay,
+            year: Some(1981),
+            runtime_minutes: Some(93),
+            rating: "18".to_string(),
+            directors: vec!["John Landis".to_string()],
+            cast: vec![
+                ("David Naughton".to_string(), "David Kessler".to_string()),
+                ("Jenny Agutter".to_string(), "Nurse Alex Price".to_string()),
+            ],
+            synopsis: "Two backpackers' trip goes wrong.".to_string(),
+            front_cover: false,
+            back_cover: false,
+        };
+        let mut movie = Movie {
+            id: "1".to_string(),
+            title: "Old title".to_string(),
+            format: DiscFormat::Dvd,
+            actors: vec![Actor {
+                name: "David Naughton".to_string(),
+                role: "Old role".to_string(),
+                voice: true,
+                uncredited: true,
+            }],
+            ..Default::default()
+        };
+
+        details.apply(
+            &mut movie,
+            [
+                Field::Title,
+                Field::SortTitle,
+                Field::Format,
+                Field::Year,
+                Field::Runtime,
+                Field::Rating,
+                Field::Directors,
+                Field::Cast,
+                Field::Synopsis,
+                Field::Upc,
+                Field::Locality,
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(movie.title, "Ihmissusi Lontoossa");
+        assert_eq!(movie.sort_title, "Ihmissusi Lontoossa");
+        assert_eq!(movie.format, DiscFormat::BluRay);
+        assert_eq!(movie.year, Some(1981));
+        assert_eq!(movie.runtime_minutes, Some(93));
+        assert_eq!(movie.rating, "18");
+        assert_eq!(movie.directors, vec!["John Landis"]);
+        assert_eq!(
+            movie.actors,
+            vec![
+                Actor {
+                    name: "David Naughton".to_string(),
+                    role: "David Kessler".to_string(),
+                    voice: true,
+                    uncredited: true,
+                },
+                Actor::new("Jenny Agutter", "Nurse Alex Price"),
+            ]
+        );
+        assert_eq!(movie.overview, "Two backpackers' trip goes wrong.");
+        assert_eq!(movie.upc, "044007867020");
+        assert_eq!(movie.locality, "Finland");
+    }
+
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("mymovies-{name}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("kinocatalog-{name}-{}", std::process::id()))
     }
 }

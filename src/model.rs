@@ -101,6 +101,8 @@ pub struct Movie {
     #[serde(default)]
     pub original_title: String,
     #[serde(default)]
+    pub alternative_titles: Vec<String>,
+    #[serde(default)]
     pub sort_title: String,
     #[serde(default)]
     pub format: DiscFormat,
@@ -156,6 +158,9 @@ pub struct Movie {
     pub collection_number: String,
     #[serde(default)]
     pub case_type: String,
+    /// Cut status and runtime reported by DVDCompare for this release.
+    #[serde(default)]
+    pub cuts: String,
     #[serde(default)]
     pub location: String,
     #[serde(default)]
@@ -210,9 +215,15 @@ impl Movie {
     /// Compact label used by the format badge in the list and details header.
     pub fn format_badge_label(&self) -> String {
         if self.is_3d {
-            format!("{} 3D", self.format.short_label())
-        } else {
-            self.format.short_label().to_string()
+            return match self.format {
+                DiscFormat::BluRay => "3D BD".to_string(),
+                other => format!("3D {}", other.short_label()),
+            };
+        }
+
+        match self.format {
+            DiscFormat::UltraHd => "4K UHD".to_string(),
+            other => other.short_label().to_string(),
         }
     }
 
@@ -282,6 +293,38 @@ impl Collection {
 
     pub fn sort(&mut self) {
         self.movies.sort_by_key(Movie::sort_key);
+    }
+
+    /// Rewrites country names and UPCs to their canonical form. Used when
+    /// loading and saving so collections only ever store one form of each
+    /// country and UPCs contain digits only.
+    ///
+    /// Returns true when any value changed.
+    pub fn normalize(&mut self) -> bool {
+        let mut changed = false;
+        for movie in &mut self.movies {
+            let country = normalize_country(&movie.country);
+            if country != movie.country {
+                movie.country = country;
+                changed = true;
+            }
+
+            let upc = normalize_upc(&movie.upc);
+            if upc != movie.upc {
+                movie.upc = upc;
+                changed = true;
+            }
+
+            // Older imports could derive the stable id from a hyphenated UPC.
+            if let Some(value) = movie.id.strip_prefix("upc:") {
+                let digits = normalize_upc(value);
+                if digits != value {
+                    movie.id = format!("upc:{digits}");
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Merges freshly imported movies into the collection.
@@ -405,6 +448,38 @@ pub fn join_list(items: &[String]) -> String {
     items.join(", ")
 }
 
+/// Canonicalizes a country name or comma-separated country list.
+///
+/// Providers disagree about the United States (`United States` versus
+/// `United States of America`), so one spelling is used everywhere.
+pub fn normalize_country(country: &str) -> String {
+    let mut countries: Vec<String> = Vec::new();
+    for part in country.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let canonical = if part.eq_ignore_ascii_case("United States of America") {
+            "United States"
+        } else {
+            part
+        };
+        if !countries
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(canonical))
+        {
+            countries.push(canonical.to_string());
+        }
+    }
+    countries.join(", ")
+}
+
+/// Keeps only the digits of a UPC so stored barcodes never contain separators
+/// such as hyphens or spaces.
+pub fn normalize_upc(upc: &str) -> String {
+    upc.chars().filter(char::is_ascii_digit).collect::<String>()
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeStats {
     pub added: usize,
@@ -508,7 +583,14 @@ mod tests {
 
         disc.is_3d = true;
         assert_eq!(disc.format_label(), "Blu-ray 3D");
-        assert_eq!(disc.format_badge_label(), "BD 3D");
+        assert_eq!(disc.format_badge_label(), "3D BD");
+
+        let mut uhd = movie("2", "Dune", DiscFormat::UltraHd, 2021);
+        assert_eq!(uhd.format_badge_label(), "4K UHD");
+
+        uhd.format = DiscFormat::Dvd;
+        uhd.is_3d = true;
+        assert_eq!(uhd.format_badge_label(), "3D DVD");
     }
 
     #[test]
@@ -517,6 +599,56 @@ mod tests {
             split_list("Drama, Thriller; drama, , Crime"),
             vec!["Drama", "Thriller", "Crime"]
         );
+    }
+
+    #[test]
+    fn normalizes_united_states_country_names() {
+        assert_eq!(
+            normalize_country("United States of America"),
+            "United States"
+        );
+        assert_eq!(
+            normalize_country("  united states of america "),
+            "United States"
+        );
+        assert_eq!(
+            normalize_country("United States of America, United Kingdom"),
+            "United States, United Kingdom"
+        );
+        assert_eq!(
+            normalize_country("United States of America, united states"),
+            "United States"
+        );
+        assert_eq!(normalize_country("United Kingdom"), "United Kingdom");
+        assert_eq!(normalize_country(""), "");
+    }
+
+    #[test]
+    fn normalizes_upcs_to_digits_only() {
+        assert_eq!(normalize_upc("012236-047605"), "012236047605");
+        assert_eq!(normalize_upc(" 044007 867020 "), "044007867020");
+        assert_eq!(normalize_upc("012236-047605-x"), "012236047605");
+        assert_eq!(normalize_upc(""), "");
+    }
+
+    #[test]
+    fn normalization_reports_when_it_changes_a_collection() {
+        let mut collection = Collection {
+            version: 1,
+            movies: vec![Movie {
+                id: "upc:012236-047605".to_string(),
+                title: "Bad Lieutenant".to_string(),
+                upc: "012236-047605".to_string(),
+                country: "United States of America".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        assert!(collection.normalize());
+        assert_eq!(collection.movies[0].id, "upc:012236047605");
+        assert_eq!(collection.movies[0].upc, "012236047605");
+        assert_eq!(collection.movies[0].country, "United States");
+        assert!(!collection.normalize());
     }
 
     #[test]

@@ -97,10 +97,11 @@ impl CoverIndex {
     }
 }
 
-/// Directory that holds the cover images. `MYMOVIES_COVERS` wins; otherwise the
-/// `covers` folder in the user's home directory is used.
+/// Directory that holds the cover images. `KINOCATALOG_COVERS` wins; the old
+/// `MYMOVIES_COVERS` name still works, and otherwise the `covers` folder in the
+/// user's home directory is used.
 pub fn directory() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MYMOVIES_COVERS") {
+    if let Some(dir) = crate::storage::env_os("KINOCATALOG_COVERS", "MYMOVIES_COVERS") {
         return PathBuf::from(dir);
     }
     std::env::var_os("HOME")

@@ -9,15 +9,18 @@ use eframe::egui::{
 };
 
 use crate::covers::{self, CoverIndex, Covers};
+use crate::dvdcompare;
 use crate::import;
 use crate::letterboxd;
 use crate::lookup;
 use crate::model::{
-    Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, sort_title_for, split_list,
-    split_multiline,
+    Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, normalize_upc, sort_title_for,
+    split_list, split_multiline,
 };
 use crate::omdb;
 use crate::storage;
+use crate::tmdb;
+use crate::update;
 
 const INK: Color32 = Color32::from_rgb(10, 14, 20);
 const TEXT: Color32 = Color32::from_rgb(230, 233, 239);
@@ -39,15 +42,17 @@ const BD_FG: Color32 = Color32::from_rgb(111, 168, 255);
 const BD_BG: Color32 = Color32::from_rgb(28, 43, 69);
 const UHD_FG: Color32 = Color32::from_rgb(255, 196, 107);
 const UHD_BG: Color32 = Color32::from_rgb(57, 44, 24);
-const FORMAT_ICON_BG: Color32 = Color32::from_rgb(226, 231, 238);
 
-pub struct MyMoviesApp {
+pub struct KinoCatalogApp {
     collection: Collection,
     data_path: PathBuf,
     selected: Option<String>,
     search: String,
     format_filter: Option<DiscFormat>,
     only_3d: bool,
+    only_missing_covers: bool,
+    only_missing_year: bool,
+    only_missing_original_title: bool,
     filtered: Vec<usize>,
     list_dirty: bool,
     editor: Option<Editor>,
@@ -57,10 +62,15 @@ pub struct MyMoviesApp {
     show_full_cast: bool,
     omdb_key: Option<String>,
     omdb_dialog: Option<OmdbDialog>,
+    tmdb_key: Option<String>,
+    tmdb_dialog: Option<TmdbDialog>,
+    invelos_dialog: Option<InvelosDialog>,
+    dvdcompare_dialog: Option<DvdCompareDialog>,
     covers: CoverIndex,
     cover_textures: CoverTextures,
     cover_viewer: Option<PathBuf>,
-    format_icons: FormatIcons,
+    show_about: bool,
+    update_dialog: Option<UpdateDialog>,
 }
 
 struct Editor {
@@ -128,6 +138,50 @@ struct OmdbDialog {
     state: OmdbState,
 }
 
+struct TmdbDialog {
+    movie_id: String,
+    title: String,
+    query: String,
+    last_query: String,
+    year: Option<u16>,
+    results: Vec<tmdb::SearchResult>,
+    selected: Option<usize>,
+    state: TmdbState,
+}
+
+struct InvelosDialog {
+    movie_id: String,
+    title: String,
+    upc: String,
+    locality: String,
+    variants: Vec<lookup::ProfileSummary>,
+    selected: Option<usize>,
+    state: InvelosState,
+}
+
+struct DvdCompareDialog {
+    movie_id: String,
+    title: String,
+    year: Option<u16>,
+    format: DiscFormat,
+    query: String,
+    last_query: String,
+    results: Vec<dvdcompare::SearchResult>,
+    selected: Option<usize>,
+    film: Option<dvdcompare::Film>,
+    release_selected: Option<usize>,
+    state: DvdCompareState,
+}
+
+struct UpdateDialog {
+    state: UpdateState,
+}
+
+enum UpdateState {
+    Checking(Receiver<Result<update::Outcome, String>>),
+    Finished(Result<update::Outcome, String>),
+}
+
 enum OmdbState {
     /// No usable API key is known, so ask for one before fetching.
     RequestKey {
@@ -151,6 +205,124 @@ enum OmdbAction {
     Retry,
     ChangeKey,
     SaveKey(String),
+    Save,
+}
+
+enum TmdbState {
+    /// No usable API key is known, so ask for one before searching.
+    RequestKey {
+        input: String,
+        error: Option<String>,
+    },
+    /// The title search runs on a worker thread.
+    Searching(Receiver<Result<Vec<tmdb::SearchResult>, String>>),
+    /// Several titles may match; the user picks the right one.
+    Choosing,
+    /// Details for the chosen TMDB id are being loaded.
+    Fetching {
+        result: tmdb::SearchResult,
+        receiver: Receiver<Result<omdb::Details, String>>,
+    },
+    Comparing {
+        result: tmdb::SearchResult,
+        details: Box<omdb::Details>,
+        changes: Vec<omdb::Change>,
+    },
+    Failed {
+        message: String,
+        retry: TmdbRetry,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TmdbRetry {
+    Search,
+    Details,
+}
+
+enum TmdbAction {
+    Close,
+    Retry,
+    SearchAgain,
+    ChooseAnother,
+    ChangeKey,
+    SaveKey(String),
+    Fetch(usize),
+    Save,
+}
+
+enum InvelosState {
+    /// The barcode is being looked up in the variant service.
+    FindingVariants(Receiver<Result<Vec<lookup::ProfileSummary>, String>>),
+    /// Several localities exist for the barcode; the user picks one.
+    Choosing,
+    /// The chosen profile is being downloaded.
+    Fetching {
+        profile_id: String,
+        receiver: Receiver<Result<lookup::MovieDetails, String>>,
+    },
+    Comparing {
+        details: Box<lookup::MovieDetails>,
+        changes: Vec<lookup::Change>,
+    },
+    Failed {
+        message: String,
+        retry: InvelosRetry,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum InvelosRetry {
+    Variants,
+    Profile,
+}
+
+enum InvelosAction {
+    Close,
+    Retry,
+    ChooseAnother,
+    Fetch(usize),
+    Save,
+}
+
+enum DvdCompareState {
+    /// The title search runs on a worker thread against dvdcompare.net.
+    Searching(Receiver<Result<Vec<dvdcompare::SearchResult>, String>>),
+    /// The user picks the right film from the search results.
+    ChoosingFilm,
+    /// The chosen film page and all its releases are being loaded.
+    FetchingFilm {
+        result: dvdcompare::SearchResult,
+        receiver: Receiver<Result<dvdcompare::Film, String>>,
+    },
+    /// The film is loaded; the user picks one of its regional releases.
+    ChoosingRelease,
+    /// The release is loaded and the user chooses which fields to apply.
+    Comparing {
+        release: dvdcompare::Release,
+        details: Box<dvdcompare::Details>,
+        changes: Vec<dvdcompare::Change>,
+    },
+    Failed {
+        message: String,
+        retry: DvdCompareRetry,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum DvdCompareRetry {
+    Search,
+    Film,
+}
+
+enum DvdCompareAction {
+    Close,
+    Retry,
+    SearchAgain,
+    ChooseAnotherFilm,
+    ChooseAnotherRelease,
+    FetchFilm(usize),
+    CompareRelease(usize),
     Save,
 }
 
@@ -193,6 +365,7 @@ impl StatusMessage {
 struct MovieForm {
     title: String,
     original_title: String,
+    alternative_titles: String,
     sort_title: String,
     format: DiscFormat,
     is_3d: bool,
@@ -200,6 +373,7 @@ struct MovieForm {
     runtime: String,
     rating: String,
     genres: String,
+    regions: String,
     studios: String,
     directors: String,
     cast: String,
@@ -208,6 +382,7 @@ struct MovieForm {
     locality: String,
     collection_number: String,
     case_type: String,
+    cuts: String,
     purchase_date: String,
     purchase_price: String,
     location: String,
@@ -220,6 +395,7 @@ impl MovieForm {
         Self {
             title: movie.title.clone(),
             original_title: movie.original_title.clone(),
+            alternative_titles: movie.alternative_titles.join("\n"),
             // Only a lookup supplies a different sort title; when editing, an
             // empty value keeps the existing one unless the title changes.
             sort_title: String::new(),
@@ -232,6 +408,7 @@ impl MovieForm {
                 .unwrap_or_default(),
             rating: movie.rating.clone(),
             genres: join_list(&movie.genres),
+            regions: join_list(&movie.regions),
             studios: movie.studios.join("\n"),
             directors: movie.directors.join("\n"),
             cast: movie
@@ -251,6 +428,7 @@ impl MovieForm {
             locality: movie.locality.clone(),
             collection_number: movie.collection_number.clone(),
             case_type: movie.case_type.clone(),
+            cuts: movie.cuts.clone(),
             purchase_date: movie.purchase_date.clone(),
             purchase_price: movie.purchase_price.clone(),
             location: movie.location.clone(),
@@ -274,20 +452,23 @@ impl MovieForm {
 
         movie.title = title.to_string();
         movie.original_title = self.original_title.trim().to_string();
+        movie.alternative_titles = split_multiline(&self.alternative_titles);
         movie.format = self.format;
         movie.is_3d = self.is_3d;
         movie.year = parse_optional_number(&self.year, "Year")?;
         movie.runtime_minutes = parse_optional_number(&self.runtime, "Runtime")?;
         movie.rating = self.rating.trim().to_string();
         movie.genres = split_list(&self.genres);
+        movie.regions = split_list(&self.regions);
         movie.studios = split_multiline(&self.studios);
         movie.directors = split_multiline(&self.directors);
         movie.actors = parse_cast(&self.cast, &movie.actors);
         movie.overview = self.overview.trim().to_string();
-        movie.upc = self.upc.trim().to_string();
+        movie.upc = normalize_upc(&self.upc);
         movie.locality = self.locality.trim().to_string();
         movie.collection_number = self.collection_number.trim().to_string();
         movie.case_type = self.case_type.trim().to_string();
+        movie.cuts = self.cuts.trim().to_string();
         movie.purchase_date = self.purchase_date.trim().to_string();
         movie.purchase_price = self.purchase_price.trim().to_string();
         movie.location = self.location.trim().to_string();
@@ -349,7 +530,7 @@ enum EditorAction {
     Cancel,
 }
 
-impl MyMoviesApp {
+impl KinoCatalogApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         collection: Collection,
@@ -359,6 +540,7 @@ impl MyMoviesApp {
         configure_style(&cc.egui_ctx);
 
         let omdb_key = storage::load_omdb_key(&data_path);
+        let tmdb_key = storage::load_tmdb_key(&data_path);
         let mut app = Self {
             collection,
             data_path,
@@ -366,6 +548,9 @@ impl MyMoviesApp {
             search: String::new(),
             format_filter: None,
             only_3d: false,
+            only_missing_covers: false,
+            only_missing_year: false,
+            only_missing_original_title: false,
             filtered: Vec::new(),
             list_dirty: true,
             editor: None,
@@ -375,10 +560,15 @@ impl MyMoviesApp {
             show_full_cast: false,
             omdb_key,
             omdb_dialog: None,
+            tmdb_key,
+            tmdb_dialog: None,
+            invelos_dialog: None,
+            dvdcompare_dialog: None,
             covers: CoverIndex::scan(&covers::directory()),
             cover_textures: CoverTextures::default(),
             cover_viewer: None,
-            format_icons: FormatIcons::load(&cc.egui_ctx),
+            show_about: false,
+            update_dialog: None,
         };
 
         app.collection.sort();
@@ -390,9 +580,18 @@ impl MyMoviesApp {
     }
 
     fn refresh_filter(&mut self) {
-        self.filtered =
-            self.collection
-                .filter_indices(&self.search, self.format_filter, self.only_3d);
+        self.filtered = filter_movies(
+            &self.collection,
+            &self.covers,
+            &self.search,
+            self.format_filter,
+            self.only_3d,
+            MissingFilters {
+                covers: self.only_missing_covers,
+                year: self.only_missing_year,
+                original_title: self.only_missing_original_title,
+            },
+        );
     }
 
     fn open_add(&mut self) {
@@ -406,7 +605,7 @@ impl MyMoviesApp {
     fn commit(&mut self, message: impl Into<String>) {
         self.list_dirty = true;
         let message = message.into();
-        match storage::save(&self.data_path, &self.collection) {
+        match storage::save(&self.data_path, &mut self.collection) {
             Ok(()) => self.status = Some(StatusMessage::success(message)),
             Err(error) => {
                 self.status = Some(StatusMessage::error(format!(
@@ -544,6 +743,8 @@ impl MyMoviesApp {
         let mut add = false;
         let mut import = false;
         let mut import_letterboxd = false;
+        let mut open_about = false;
+        let mut check_updates = false;
 
         egui::Panel::top("toolbar")
             .frame(
@@ -553,7 +754,7 @@ impl MyMoviesApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("myMovies").size(21.0).strong().color(TEXT));
+                    ui.label(RichText::new("KinoCatalog").size(21.0).strong().color(TEXT));
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new("DVD & Blu-ray collection")
@@ -591,6 +792,25 @@ impl MyMoviesApp {
                                     add = true;
                                     ui.close();
                                 }
+                                ui.separator();
+                                if ui
+                                    .button("Update to new version…")
+                                    .on_hover_text(
+                                        "Check GitHub for a newer release and install it",
+                                    )
+                                    .clicked()
+                                {
+                                    check_updates = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button("About")
+                                    .on_hover_text("About KinoCatalog")
+                                    .clicked()
+                                {
+                                    open_about = true;
+                                    ui.close();
+                                }
                             });
                     });
                 });
@@ -604,6 +824,12 @@ impl MyMoviesApp {
         }
         if import_letterboxd {
             self.import_letterboxd();
+        }
+        if open_about {
+            self.show_about = true;
+        }
+        if check_updates {
+            self.start_update_check();
         }
     }
 
@@ -649,6 +875,46 @@ impl MyMoviesApp {
                         self.search.clear();
                         self.list_dirty = true;
                     }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let active = usize::from(self.only_missing_covers)
+                        + usize::from(self.only_missing_year)
+                        + usize::from(self.only_missing_original_title);
+                    let label = if active > 0 {
+                        format!("Filter by ({active}) ▾")
+                    } else {
+                        "Filter by ▾".to_string()
+                    };
+                    let response = ui.add(egui::Button::new(RichText::new(label).size(11.5)));
+                    egui::Popup::menu(&response).show(|ui| {
+                        ui.set_min_width(190.0);
+                        if ui
+                            .checkbox(&mut self.only_missing_covers, "Missing covers")
+                            .on_hover_text("Show only movies without front or back cover pictures")
+                            .changed()
+                        {
+                            self.list_dirty = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.only_missing_year, "Missing year")
+                            .on_hover_text("Show only movies without a release year")
+                            .changed()
+                        {
+                            self.list_dirty = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.only_missing_original_title,
+                                "Missing original title",
+                            )
+                            .on_hover_text("Show only movies without an original title")
+                            .changed()
+                        {
+                            self.list_dirty = true;
+                        }
+                    });
                 });
 
                 ui.add_space(6.0);
@@ -728,7 +994,6 @@ impl MyMoviesApp {
                 }
 
                 let filtered = self.filtered.clone();
-                let format_icons = &self.format_icons;
                 egui::ScrollArea::vertical()
                     .id_salt("movie_list")
                     .auto_shrink([false, false])
@@ -736,7 +1001,7 @@ impl MyMoviesApp {
                         for index in range {
                             let movie = &self.collection.movies[filtered[index]];
                             let selected = self.selected.as_deref() == Some(movie.id.as_str());
-                            if movie_row(ui, movie, selected, format_icons).clicked() {
+                            if movie_row(ui, movie, selected).clicked() {
                                 self.selected = Some(movie.id.clone());
                                 self.show_full_cast = false;
                             }
@@ -771,6 +1036,9 @@ impl MyMoviesApp {
         let mut edit = false;
         let mut delete = false;
         let mut update_omdb = false;
+        let mut update_tmdb = false;
+        let mut update_invelos = false;
+        let mut update_dvdcompare = false;
         let mut show_full_cast = self.show_full_cast;
         let movie_covers = self.covers.for_upc(&movie.upc).cloned();
 
@@ -790,7 +1058,9 @@ impl MyMoviesApp {
                         );
                     }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.with_layout(
+                        Layout::right_to_left(Align::Center).with_main_wrap(true),
+                        |ui| {
                         if ui
                             .add(
                                 egui::Button::new(RichText::new("Delete").color(ERROR))
@@ -811,6 +1081,31 @@ impl MyMoviesApp {
                             .clicked()
                         {
                             update_omdb = true;
+                        }
+                        if ui
+                            .button("Update from TMDB")
+                            .on_hover_text("Search The Movie Database and choose fields to update")
+                            .clicked()
+                        {
+                            update_tmdb = true;
+                        }
+                        if ui
+                            .button("Update from Invelos")
+                            .on_hover_text(
+                                "Look up this movie's barcode in Invelos and choose fields to update",
+                            )
+                            .clicked()
+                        {
+                            update_invelos = true;
+                        }
+                        if ui
+                            .button("Update from DVDCompare")
+                            .on_hover_text(
+                                "Search DVDCompare, choose a release, and compare disc details",
+                            )
+                            .clicked()
+                        {
+                            update_dvdcompare = true;
                         }
                     });
                 });
@@ -862,6 +1157,7 @@ impl MyMoviesApp {
                 let mut facts: Vec<(&str, String)> = vec![
                     ("Format", movie.format_label()),
                     ("Original title", movie.original_title.clone()),
+                    ("Alternative titles", join_list(&movie.alternative_titles)),
                     ("Released", movie.released.clone()),
                     (
                         if movie.format_label().starts_with("Blu-ray") {
@@ -990,6 +1286,11 @@ impl MyMoviesApp {
                     }
                 }
 
+                if !movie.cuts.is_empty() {
+                    section_title(ui, "Cuts");
+                    ui.label(RichText::new(&movie.cuts).size(13.0).color(TEXT));
+                }
+
                 if !movie.purchase_date.is_empty()
                     || !movie.purchase_price.is_empty()
                     || !movie.purchase_place.is_empty()
@@ -1036,11 +1337,26 @@ impl MyMoviesApp {
             self.open_omdb(&movie);
             ui.ctx().request_repaint();
         }
+        if update_tmdb {
+            self.open_tmdb(&movie);
+            ui.ctx().request_repaint();
+        }
+        if update_invelos {
+            self.open_invelos(&movie);
+            ui.ctx().request_repaint();
+        }
+        if update_dvdcompare {
+            self.open_dvdcompare(&movie);
+            ui.ctx().request_repaint();
+        }
     }
 
     /// Starts the OMDb workflow for a movie, asking for an API key when none
     /// has been stored yet.
     fn open_omdb(&mut self, movie: &Movie) {
+        self.tmdb_dialog = None;
+        self.invelos_dialog = None;
+        self.dvdcompare_dialog = None;
         let dialog = OmdbDialog {
             movie_id: movie.id.clone(),
             title: movie.title.clone(),
@@ -1238,7 +1554,7 @@ impl MyMoviesApp {
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 for (index, change) in changes.iter_mut().enumerate() {
-                                    omdb_change_row(ui, index, change);
+                                    change_row(ui, index, change, "OMDb");
                                     ui.add_space(7.0);
                                 }
                             });
@@ -1371,6 +1687,1678 @@ impl MyMoviesApp {
         }
     }
 
+    /// Starts the TMDB workflow. The title search runs first; the user then
+    /// chooses the matching result before details are loaded by TMDB id.
+    fn open_tmdb(&mut self, movie: &Movie) {
+        self.omdb_dialog = None;
+        self.invelos_dialog = None;
+        self.dvdcompare_dialog = None;
+        let dialog = TmdbDialog {
+            movie_id: movie.id.clone(),
+            title: movie.title.clone(),
+            query: movie.title.clone(),
+            last_query: movie.title.clone(),
+            year: movie.year,
+            results: Vec::new(),
+            selected: None,
+            state: TmdbState::RequestKey {
+                input: self.tmdb_key.clone().unwrap_or_default(),
+                error: None,
+            },
+        };
+
+        if let Some(key) = self.tmdb_key.clone() {
+            self.start_tmdb_search(dialog, key);
+        } else {
+            self.tmdb_dialog = Some(dialog);
+        }
+    }
+
+    fn start_tmdb_search(&mut self, mut dialog: TmdbDialog, key: String) {
+        let (sender, receiver) = mpsc::channel();
+        let query = dialog.query.trim().to_string();
+        dialog.last_query = query.clone();
+        let worker_key = key.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(tmdb::search(&worker_key, &query));
+        });
+        dialog.results.clear();
+        dialog.selected = None;
+        dialog.state = TmdbState::Searching(receiver);
+        self.tmdb_key = Some(key);
+        self.tmdb_dialog = Some(dialog);
+    }
+
+    fn start_tmdb_details(
+        &mut self,
+        mut dialog: TmdbDialog,
+        key: String,
+        result: tmdb::SearchResult,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let worker_key = key.clone();
+        let id = result.id;
+        std::thread::spawn(move || {
+            let _ = sender.send(tmdb::fetch(&worker_key, id));
+        });
+        dialog.selected = dialog
+            .results
+            .iter()
+            .position(|candidate| candidate.id == result.id);
+        dialog.state = TmdbState::Fetching { result, receiver };
+        self.tmdb_key = Some(key);
+        self.tmdb_dialog = Some(dialog);
+    }
+
+    /// Polls the TMDB search and detail requests, then draws the key, search
+    /// results, progress, comparison and error windows.
+    fn tmdb_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.tmdb_dialog.take() else {
+            return;
+        };
+
+        if let TmdbState::Searching(receiver) = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The TMDB search stopped unexpectedly.".to_string()));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(results) if results.is_empty() => {
+                        dialog.state = TmdbState::Failed {
+                            message: format!(
+                                "TMDB found no matches for “{}”.",
+                                dialog.query.trim()
+                            ),
+                            retry: TmdbRetry::Search,
+                        };
+                    }
+                    Ok(results) => {
+                        let preferred = results
+                            .iter()
+                            .position(|result| result.year == dialog.year)
+                            .unwrap_or(0);
+                        dialog.selected = Some(preferred);
+                        dialog.results = results;
+                        dialog.state = TmdbState::Choosing;
+                    }
+                    Err(message) => {
+                        dialog.state = TmdbState::Failed {
+                            message,
+                            retry: TmdbRetry::Search,
+                        };
+                    }
+                }
+            }
+        }
+
+        if let TmdbState::Fetching { receiver, .. } = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The TMDB lookup stopped unexpectedly.".to_string()));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(mut details) => {
+                        let chosen = match &dialog.state {
+                            TmdbState::Fetching { result, .. } => result.clone(),
+                            _ => unreachable!("only a fetching dialog can finish a lookup"),
+                        };
+                        add_picked_title(
+                            &mut details,
+                            &dialog.last_query,
+                            &dialog.title,
+                            &chosen.title,
+                        );
+                        let Some(movie) = self.collection.find(&dialog.movie_id) else {
+                            self.status = Some(StatusMessage::error(
+                                "This movie is no longer in the collection.".to_string(),
+                            ));
+                            return;
+                        };
+                        let changes = details.changes(movie);
+                        dialog.state = TmdbState::Comparing {
+                            result: chosen,
+                            details: Box::new(details),
+                            changes,
+                        };
+                    }
+                    Err(message) => {
+                        dialog.state = TmdbState::Failed {
+                            message,
+                            retry: TmdbRetry::Details,
+                        };
+                    }
+                }
+            }
+        }
+
+        let mut open = true;
+        let mut action = None;
+        let lookup = match dialog.year {
+            Some(year) => format!("“{}” ({year})", dialog.title),
+            None => format!("“{}”", dialog.title),
+        };
+
+        match &mut dialog.state {
+            TmdbState::RequestKey { input, error } => {
+                egui::Window::new("TMDB API key")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(490.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Enter your TMDB API key or read access token to update {lookup}."
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            TextEdit::singleline(input)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("TMDB API key (v3) or read access token (v4)"),
+                        );
+                        ui.add_space(5.0);
+                        ui.hyperlink_to(
+                            RichText::new("Get a key at themoviedb.org")
+                                .size(11.5)
+                                .color(ACCENT),
+                            "https://www.themoviedb.org/settings/api",
+                        );
+
+                        if let Some(error) = error {
+                            ui.add_space(5.0);
+                            ui.label(RichText::new(error.as_str()).size(12.0).color(ERROR));
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Save and continue").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                            {
+                                let key = input.trim().to_string();
+                                if key.is_empty() {
+                                    *error = Some(
+                                        "Enter the TMDB API key or read access token.".to_string(),
+                                    );
+                                } else {
+                                    action = Some(TmdbAction::SaveKey(key));
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(TmdbAction::Close);
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "The key is stored beside your collection in {}.",
+                                storage::display_path(&storage::tmdb_key_path(&self.data_path))
+                            ))
+                            .size(10.5)
+                            .color(MUTED),
+                        );
+                    });
+            }
+            TmdbState::Searching(_) => {
+                egui::Window::new("Update from TMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(400.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Searching TMDB for {lookup}…"))
+                                    .size(12.5)
+                                    .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Cancel").clicked() {
+                            action = Some(TmdbAction::Close);
+                        }
+                    });
+            }
+            TmdbState::Choosing => {
+                egui::Window::new("Update from TMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(620.0)
+                    .max_height(720.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Choose the correct match for {lookup}. TMDB returned {} result{}.",
+                                dialog.results.len(),
+                                if dialog.results.len() == 1 { "" } else { "s" }
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Search").size(12.0).color(MUTED));
+                            let response = ui.add(
+                                TextEdit::singleline(&mut dialog.query)
+                                    .desired_width(360.0)
+                                    .hint_text("Movie title"),
+                            );
+                            let enter = response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            if ui.button("Search again").clicked() || enter {
+                                action = Some(TmdbAction::SearchAgain);
+                            }
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, result) in dialog.results.iter().enumerate() {
+                                    let selected = dialog.selected == Some(index);
+                                    if tmdb_result_row(ui, index, result, selected).clicked() {
+                                        dialog.selected = Some(index);
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let selected = dialog.selected;
+                            if ui
+                                .add_enabled(
+                                    selected.is_some(),
+                                    egui::Button::new(
+                                        RichText::new("Load selected title").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                                && let Some(index) = selected
+                            {
+                                action = Some(TmdbAction::Fetch(index));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(TmdbAction::Close);
+                            }
+                        });
+                    });
+            }
+            TmdbState::Fetching { result, .. } => {
+                egui::Window::new("Update from TMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(420.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Loading “{}”{} from TMDB…",
+                                    result.title,
+                                    result
+                                        .year
+                                        .map(|year| format!(" ({year})"))
+                                        .unwrap_or_default()
+                                ))
+                                .size(12.5)
+                                .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Choose another title").clicked() {
+                                action = Some(TmdbAction::ChooseAnother);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(TmdbAction::Close);
+                            }
+                        });
+                    });
+            }
+            TmdbState::Comparing {
+                result: matched,
+                changes,
+                ..
+            } => {
+                egui::Window::new("Update from TMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(660.0)
+                    .max_height(720.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Choose which TMDB values to save for {lookup}. Matched “{}”{}.",
+                                matched.title,
+                                matched
+                                    .year
+                                    .map(|year| format!(" ({year})"))
+                                    .unwrap_or_default()
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Select all").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = true;
+                                }
+                            }
+                            if ui.button("Select none").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = false;
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(440.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, change) in changes.iter_mut().enumerate() {
+                                    change_row(ui, index, change, "TMDB");
+                                    ui.add_space(7.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let any_selected = changes.iter().any(|change| change.selected);
+                            if ui
+                                .add_enabled(
+                                    any_selected,
+                                    egui::Button::new(
+                                        RichText::new("Update movie").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                            {
+                                action = Some(TmdbAction::Save);
+                            }
+                            if ui.button("Choose another title").clicked() {
+                                action = Some(TmdbAction::ChooseAnother);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(TmdbAction::Close);
+                            }
+                        });
+                    });
+            }
+            TmdbState::Failed { message, retry } => {
+                egui::Window::new("Update from TMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(490.0)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(message.as_str()).size(12.5).color(ERROR));
+                        ui.add_space(6.0);
+                        if matches!(*retry, TmdbRetry::Search) {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Title").size(12.0).color(MUTED));
+                                ui.add(
+                                    TextEdit::singleline(&mut dialog.query)
+                                        .desired_width(320.0)
+                                        .hint_text("Movie title"),
+                                );
+                            });
+                            ui.add_space(6.0);
+                        }
+                        ui.label(
+                            RichText::new("Check the key, the title, or your connection.")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Try again").clicked() {
+                                action = Some(TmdbAction::Retry);
+                            }
+                            if matches!(*retry, TmdbRetry::Details)
+                                && ui.button("Choose another title").clicked()
+                            {
+                                action = Some(TmdbAction::ChooseAnother);
+                            }
+                            if ui.button("Change API key").clicked() {
+                                action = Some(TmdbAction::ChangeKey);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(TmdbAction::Close);
+                            }
+                        });
+                    });
+            }
+        }
+
+        if !open && action.is_none() {
+            action = Some(TmdbAction::Close);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            action = Some(TmdbAction::Close);
+        }
+
+        match action {
+            Some(TmdbAction::Close) => {
+                self.tmdb_dialog = None;
+            }
+            Some(TmdbAction::SaveKey(key)) => match storage::save_tmdb_key(&self.data_path, &key) {
+                Ok(()) => self.start_tmdb_search(dialog, key),
+                Err(error) => {
+                    if let TmdbState::RequestKey { error: slot, .. } = &mut dialog.state {
+                        *slot = Some(error);
+                    }
+                    self.tmdb_dialog = Some(dialog);
+                }
+            },
+            Some(TmdbAction::SearchAgain) => {
+                if let Some(key) = self.tmdb_key.clone() {
+                    self.start_tmdb_search(dialog, key);
+                } else {
+                    dialog.state = TmdbState::RequestKey {
+                        input: String::new(),
+                        error: None,
+                    };
+                    self.tmdb_dialog = Some(dialog);
+                }
+            }
+            Some(TmdbAction::Retry) => {
+                let retry = match &dialog.state {
+                    TmdbState::Failed { retry, .. } => *retry,
+                    _ => TmdbRetry::Search,
+                };
+                match retry {
+                    TmdbRetry::Search => {
+                        if let Some(key) = self.tmdb_key.clone() {
+                            self.start_tmdb_search(dialog, key);
+                        } else {
+                            dialog.state = TmdbState::RequestKey {
+                                input: String::new(),
+                                error: None,
+                            };
+                            self.tmdb_dialog = Some(dialog);
+                        }
+                    }
+                    TmdbRetry::Details => {
+                        let selected = dialog.selected;
+                        match (self.tmdb_key.clone(), selected) {
+                            (Some(key), Some(index)) => {
+                                if let Some(result) = dialog.results.get(index).cloned() {
+                                    self.start_tmdb_details(dialog, key, result);
+                                } else {
+                                    dialog.state = TmdbState::Choosing;
+                                    self.tmdb_dialog = Some(dialog);
+                                }
+                            }
+                            _ => {
+                                dialog.state = TmdbState::Choosing;
+                                self.tmdb_dialog = Some(dialog);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(TmdbAction::ChooseAnother) => {
+                dialog.state = TmdbState::Choosing;
+                self.tmdb_dialog = Some(dialog);
+            }
+            Some(TmdbAction::ChangeKey) => {
+                dialog.state = TmdbState::RequestKey {
+                    input: self.tmdb_key.clone().unwrap_or_default(),
+                    error: None,
+                };
+                self.tmdb_dialog = Some(dialog);
+            }
+            Some(TmdbAction::Fetch(index)) => {
+                dialog.selected = Some(index);
+                if let Some(result) = dialog.results.get(index).cloned() {
+                    if let Some(key) = self.tmdb_key.clone() {
+                        self.start_tmdb_details(dialog, key, result);
+                    } else {
+                        dialog.state = TmdbState::RequestKey {
+                            input: String::new(),
+                            error: None,
+                        };
+                        self.tmdb_dialog = Some(dialog);
+                    }
+                } else {
+                    self.tmdb_dialog = Some(dialog);
+                }
+            }
+            Some(TmdbAction::Save) => {
+                let applied = match &dialog.state {
+                    TmdbState::Comparing {
+                        details, changes, ..
+                    } => {
+                        let fields: Vec<_> = changes
+                            .iter()
+                            .filter(|change| change.selected)
+                            .map(|change| change.field)
+                            .collect();
+                        let count = fields.len();
+                        self.collection.find_mut(&dialog.movie_id).map(|movie| {
+                            details.apply(movie, fields.into_iter());
+                            (movie.title.clone(), count)
+                        })
+                    }
+                    _ => None,
+                };
+                self.tmdb_dialog = None;
+                match applied {
+                    Some((title, count)) if count > 0 => self.commit(format!(
+                        "Updated “{title}” from TMDB ({count} field{}).",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    Some(_) => {
+                        self.status = Some(StatusMessage::info("No fields were selected."));
+                    }
+                    None => {
+                        self.status = Some(StatusMessage::error(
+                            "This movie is no longer in the collection.".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                self.tmdb_dialog = Some(dialog);
+            }
+        }
+    }
+
+    /// Starts the Invelos workflow for a movie by looking up its barcode.
+    fn open_invelos(&mut self, movie: &Movie) {
+        self.omdb_dialog = None;
+        self.tmdb_dialog = None;
+        self.dvdcompare_dialog = None;
+
+        let upc = normalize_upc(&movie.upc);
+        if upc.is_empty() {
+            self.invelos_dialog = None;
+            self.status = Some(StatusMessage::error(
+                "This movie has no barcode (UPC) to look up in Invelos.".to_string(),
+            ));
+            return;
+        }
+
+        let dialog = InvelosDialog {
+            movie_id: movie.id.clone(),
+            title: movie.title.clone(),
+            upc,
+            locality: movie.locality.clone(),
+            variants: Vec::new(),
+            selected: None,
+            state: InvelosState::Failed {
+                message: String::new(),
+                retry: InvelosRetry::Variants,
+            },
+        };
+        self.start_invelos_variants(dialog);
+    }
+
+    fn start_invelos_variants(&mut self, mut dialog: InvelosDialog) {
+        let (sender, receiver) = mpsc::channel();
+        let upc = dialog.upc.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(lookup::variants(&upc));
+        });
+        dialog.variants.clear();
+        dialog.selected = None;
+        dialog.state = InvelosState::FindingVariants(receiver);
+        self.invelos_dialog = Some(dialog);
+    }
+
+    fn start_invelos_profile(&mut self, mut dialog: InvelosDialog, profile_id: String) {
+        let (sender, receiver) = mpsc::channel();
+        let worker_id = profile_id.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(lookup::fetch_profile(&worker_id));
+        });
+        dialog.state = InvelosState::Fetching {
+            profile_id,
+            receiver,
+        };
+        self.invelos_dialog = Some(dialog);
+    }
+
+    /// Polls the Invelos variant and profile requests, then draws the progress,
+    /// locality chooser, comparison and error windows.
+    fn invelos_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.invelos_dialog.take() else {
+            return;
+        };
+
+        if let InvelosState::FindingVariants(receiver) = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The Invelos lookup stopped unexpectedly.".to_string()));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(variants) if variants.is_empty() => {
+                        dialog.state = InvelosState::Failed {
+                            message: format!(
+                                "Invelos found no profile for barcode {}.",
+                                dialog.upc
+                            ),
+                            retry: InvelosRetry::Variants,
+                        };
+                    }
+                    Ok(variants) => {
+                        let selected = preferred_variant(&variants, &dialog.locality);
+                        dialog.variants = variants;
+                        if dialog.variants.len() == 1 {
+                            let profile_id = dialog.variants[0].profile_id.clone();
+                            dialog.selected = Some(0);
+                            self.start_invelos_profile(dialog, profile_id);
+                            return;
+                        }
+                        dialog.selected = Some(selected);
+                        dialog.state = InvelosState::Choosing;
+                    }
+                    Err(message) => {
+                        dialog.state = InvelosState::Failed {
+                            message,
+                            retry: InvelosRetry::Variants,
+                        };
+                    }
+                }
+            }
+        }
+
+        if let InvelosState::Fetching { receiver, .. } = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The Invelos lookup stopped unexpectedly.".to_string()));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(details) => {
+                        // Downloading a profile may also have saved covers.
+                        self.covers = CoverIndex::scan(&covers::directory());
+                        let Some(movie) = self.collection.find(&dialog.movie_id) else {
+                            self.status = Some(StatusMessage::error(
+                                "This movie is no longer in the collection.".to_string(),
+                            ));
+                            return;
+                        };
+                        let changes = details.changes(movie);
+                        dialog.state = InvelosState::Comparing {
+                            details: Box::new(details),
+                            changes,
+                        };
+                    }
+                    Err(message) => {
+                        dialog.state = InvelosState::Failed {
+                            message,
+                            retry: InvelosRetry::Profile,
+                        };
+                    }
+                }
+            }
+        }
+
+        let mut open = true;
+        let mut action = None;
+        let lookup = format!("“{}”", dialog.title);
+
+        match &mut dialog.state {
+            InvelosState::FindingVariants(_) => {
+                egui::Window::new("Update from Invelos")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(420.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Looking up barcode {} in Invelos…",
+                                    dialog.upc
+                                ))
+                                .size(12.5)
+                                .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Cancel").clicked() {
+                            action = Some(InvelosAction::Close);
+                        }
+                    });
+            }
+            InvelosState::Choosing => {
+                egui::Window::new("Update from Invelos")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(580.0)
+                    .max_height(640.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Barcode {} has {} Invelos profiles. Choose the release to use for {lookup}.",
+                                dialog.upc,
+                                dialog.variants.len()
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        let preferred = lookup::locality();
+                        egui::ScrollArea::vertical()
+                            .max_height(380.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, variant) in dialog.variants.iter().enumerate() {
+                                    let selected = dialog.selected == Some(index);
+                                    let label = variant_label(variant, &preferred);
+                                    if ui
+                                        .selectable_label(
+                                            selected,
+                                            RichText::new(label).size(12.5),
+                                        )
+                                        .clicked()
+                                    {
+                                        dialog.selected = Some(index);
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let selected = dialog.selected;
+                            if ui
+                                .add_enabled(
+                                    selected.is_some(),
+                                    egui::Button::new(
+                                        RichText::new("Load selected profile")
+                                            .strong()
+                                            .color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                                && let Some(index) = selected
+                            {
+                                action = Some(InvelosAction::Fetch(index));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(InvelosAction::Close);
+                            }
+                        });
+                    });
+            }
+            InvelosState::Fetching { profile_id, .. } => {
+                egui::Window::new("Update from Invelos")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(440.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Loading Invelos profile {profile_id} for {lookup}…"
+                                ))
+                                .size(12.5)
+                                .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Cancel").clicked() {
+                            action = Some(InvelosAction::Close);
+                        }
+                    });
+            }
+            InvelosState::Comparing { details, changes } => {
+                egui::Window::new("Update from Invelos")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(660.0)
+                    .max_height(720.0)
+                    .show(ctx, |ui| {
+                        let locality = if details.locality.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", details.locality.trim())
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "Choose which Invelos values to save for {lookup}. Profile {}{locality}.",
+                                details.profile_id
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Select all").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = true;
+                                }
+                            }
+                            if ui.button("Select none").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = false;
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(440.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, change) in changes.iter_mut().enumerate() {
+                                    change_row(ui, index, change, "Invelos");
+                                    ui.add_space(7.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let any_selected = changes.iter().any(|change| change.selected);
+                            if ui
+                                .add_enabled(
+                                    any_selected,
+                                    egui::Button::new(
+                                        RichText::new("Update movie").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                            {
+                                action = Some(InvelosAction::Save);
+                            }
+                            if ui.button("Choose another profile").clicked() {
+                                action = Some(InvelosAction::ChooseAnother);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(InvelosAction::Close);
+                            }
+                        });
+                    });
+            }
+            InvelosState::Failed { message, retry } => {
+                egui::Window::new("Update from Invelos")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(500.0)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(message.as_str()).size(12.5).color(ERROR));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Check the barcode, the locality, or your connection.")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Try again").clicked() {
+                                action = Some(InvelosAction::Retry);
+                            }
+                            if matches!(*retry, InvelosRetry::Profile)
+                                && ui.button("Choose another profile").clicked()
+                            {
+                                action = Some(InvelosAction::ChooseAnother);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(InvelosAction::Close);
+                            }
+                        });
+                    });
+            }
+        }
+
+        if !open && action.is_none() {
+            action = Some(InvelosAction::Close);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            action = Some(InvelosAction::Close);
+        }
+
+        match action {
+            Some(InvelosAction::Close) => {
+                self.invelos_dialog = None;
+            }
+            Some(InvelosAction::Retry) => {
+                let retry = match &dialog.state {
+                    InvelosState::Failed { retry, .. } => *retry,
+                    _ => InvelosRetry::Variants,
+                };
+                match retry {
+                    InvelosRetry::Variants => self.start_invelos_variants(dialog),
+                    InvelosRetry::Profile => {
+                        let profile_id = dialog
+                            .selected
+                            .and_then(|index| dialog.variants.get(index))
+                            .map(|variant| variant.profile_id.clone());
+                        if let Some(profile_id) = profile_id {
+                            self.start_invelos_profile(dialog, profile_id);
+                        } else {
+                            dialog.state = InvelosState::Choosing;
+                            self.invelos_dialog = Some(dialog);
+                        }
+                    }
+                }
+            }
+            Some(InvelosAction::ChooseAnother) => {
+                dialog.state = InvelosState::Choosing;
+                self.invelos_dialog = Some(dialog);
+            }
+            Some(InvelosAction::Fetch(index)) => {
+                dialog.selected = Some(index);
+                let profile_id = dialog
+                    .variants
+                    .get(index)
+                    .map(|variant| variant.profile_id.clone());
+                if let Some(profile_id) = profile_id {
+                    self.start_invelos_profile(dialog, profile_id);
+                } else {
+                    self.invelos_dialog = Some(dialog);
+                }
+            }
+            Some(InvelosAction::Save) => {
+                let applied = match &dialog.state {
+                    InvelosState::Comparing { details, changes } => {
+                        let fields: Vec<_> = changes
+                            .iter()
+                            .filter(|change| change.selected)
+                            .map(|change| change.field)
+                            .collect();
+                        let count = fields.len();
+                        self.collection.find_mut(&dialog.movie_id).map(|movie| {
+                            details.apply(movie, fields.into_iter());
+                            (movie.title.clone(), count)
+                        })
+                    }
+                    _ => None,
+                };
+                self.invelos_dialog = None;
+                match applied {
+                    Some((title, count)) if count > 0 => self.commit(format!(
+                        "Updated “{title}” from Invelos ({count} field{}).",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    Some(_) => {
+                        self.status = Some(StatusMessage::info("No fields were selected."));
+                    }
+                    None => {
+                        self.status = Some(StatusMessage::error(
+                            "This movie is no longer in the collection.".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                self.invelos_dialog = Some(dialog);
+            }
+        }
+    }
+
+    /// Starts the DVDCompare workflow by searching for the movie's title.
+    fn open_dvdcompare(&mut self, movie: &Movie) {
+        self.omdb_dialog = None;
+        self.tmdb_dialog = None;
+        self.invelos_dialog = None;
+
+        let dialog = DvdCompareDialog {
+            movie_id: movie.id.clone(),
+            title: movie.title.clone(),
+            year: movie.year.filter(|year| *year > 0),
+            format: movie.format,
+            query: movie.title.clone(),
+            last_query: String::new(),
+            results: Vec::new(),
+            selected: None,
+            film: None,
+            release_selected: None,
+            state: DvdCompareState::ChoosingFilm,
+        };
+        self.start_dvdcompare_search(dialog);
+    }
+
+    fn start_dvdcompare_search(&mut self, mut dialog: DvdCompareDialog) {
+        let (sender, receiver) = mpsc::channel();
+        let query = dialog.query.trim().to_string();
+        dialog.last_query = query.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(dvdcompare::search(&query));
+        });
+        dialog.results.clear();
+        dialog.selected = None;
+        dialog.film = None;
+        dialog.release_selected = None;
+        dialog.state = DvdCompareState::Searching(receiver);
+        self.dvdcompare_dialog = Some(dialog);
+    }
+
+    fn start_dvdcompare_film(
+        &mut self,
+        mut dialog: DvdCompareDialog,
+        result: dvdcompare::SearchResult,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let film_id = result.film_id;
+        std::thread::spawn(move || {
+            let _ = sender.send(dvdcompare::film(film_id));
+        });
+        dialog.selected = dialog
+            .results
+            .iter()
+            .position(|candidate| candidate.film_id == result.film_id);
+        dialog.film = None;
+        dialog.release_selected = None;
+        dialog.state = DvdCompareState::FetchingFilm { result, receiver };
+        self.dvdcompare_dialog = Some(dialog);
+    }
+
+    /// Polls the DVDCompare search and film requests, then draws the search,
+    /// release chooser, comparison and error windows.
+    fn dvdcompare_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.dvdcompare_dialog.take() else {
+            return;
+        };
+
+        if let DvdCompareState::Searching(receiver) = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err(
+                        "The DVDCompare search stopped unexpectedly.".to_string()
+                    ));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(results) if results.is_empty() => {
+                        dialog.state = DvdCompareState::Failed {
+                            message: format!(
+                                "DVDCompare found no matches for “{}”.",
+                                dialog.last_query
+                            ),
+                            retry: DvdCompareRetry::Search,
+                        };
+                    }
+                    Ok(results) => {
+                        let preferred =
+                            dvdcompare::preferred_result(&results, dialog.year, dialog.format);
+                        dialog.selected = Some(preferred);
+                        dialog.results = results;
+                        dialog.state = DvdCompareState::ChoosingFilm;
+                    }
+                    Err(message) => {
+                        dialog.state = DvdCompareState::Failed {
+                            message,
+                            retry: DvdCompareRetry::Search,
+                        };
+                    }
+                }
+            }
+        }
+
+        if let DvdCompareState::FetchingFilm { receiver, .. } = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err(
+                        "The DVDCompare film lookup stopped unexpectedly.".to_string()
+                    ));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(film) if film.releases.is_empty() => {
+                        dialog.state = DvdCompareState::Failed {
+                            message: format!("DVDCompare has no releases for “{}”.", film.title),
+                            retry: DvdCompareRetry::Film,
+                        };
+                    }
+                    Ok(film) => {
+                        dialog.release_selected = Some(0);
+                        dialog.film = Some(film);
+                        dialog.state = DvdCompareState::ChoosingRelease;
+                    }
+                    Err(message) => {
+                        dialog.state = DvdCompareState::Failed {
+                            message,
+                            retry: DvdCompareRetry::Film,
+                        };
+                    }
+                }
+            }
+        }
+
+        let mut open = true;
+        let mut action = None;
+        let lookup = match dialog.year {
+            Some(year) => format!("“{}” ({year})", dialog.title),
+            None => format!("“{}”", dialog.title),
+        };
+
+        match &mut dialog.state {
+            DvdCompareState::Searching(_) => {
+                egui::Window::new("Update from DVDCompare")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(420.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Searching DVDCompare for {lookup}…"))
+                                    .size(12.5)
+                                    .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Cancel").clicked() {
+                            action = Some(DvdCompareAction::Close);
+                        }
+                    });
+            }
+            DvdCompareState::ChoosingFilm => {
+                egui::Window::new("Update from DVDCompare")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(680.0)
+                    .max_height(720.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Choose the right DVDCompare film for {lookup}. The search returned {} result{}.",
+                                dialog.results.len(),
+                                if dialog.results.len() == 1 { "" } else { "s" }
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Search").size(12.0).color(MUTED));
+                            let response = ui.add(
+                                TextEdit::singleline(&mut dialog.query)
+                                    .desired_width(400.0)
+                                    .hint_text("Film title"),
+                            );
+                            let enter = response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            if ui.button("Search again").clicked() || enter {
+                                action = Some(DvdCompareAction::SearchAgain);
+                            }
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(430.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, result) in dialog.results.iter().enumerate() {
+                                    let selected = dialog.selected == Some(index);
+                                    if dvdcompare_result_row(ui, index, result, selected)
+                                        .clicked()
+                                    {
+                                        dialog.selected = Some(index);
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let selected = dialog.selected;
+                            if ui
+                                .add_enabled(
+                                    selected.is_some(),
+                                    egui::Button::new(
+                                        RichText::new("Load selected film")
+                                            .strong()
+                                            .color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                                && let Some(index) = selected
+                            {
+                                action = Some(DvdCompareAction::FetchFilm(index));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(DvdCompareAction::Close);
+                            }
+                        });
+                    });
+            }
+            DvdCompareState::FetchingFilm { result, .. } => {
+                egui::Window::new("Update from DVDCompare")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(440.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Loading “{}”{} from DVDCompare…",
+                                    result.title,
+                                    result
+                                        .year
+                                        .map(|year| format!(" ({year})"))
+                                        .unwrap_or_default()
+                                ))
+                                .size(12.5)
+                                .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Choose another film").clicked() {
+                                action = Some(DvdCompareAction::ChooseAnotherFilm);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(DvdCompareAction::Close);
+                            }
+                        });
+                    });
+            }
+            DvdCompareState::ChoosingRelease => {
+                if let Some(film) = dialog.film.clone() {
+                    egui::Window::new("Update from DVDCompare")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(true)
+                        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                        .default_width(720.0)
+                        .max_height(740.0)
+                        .show(ctx, |ui| {
+                            let year = film
+                                .year
+                                .map(|year| format!(" ({year})"))
+                                .unwrap_or_default();
+                            let fid = film
+                                .film_id
+                                .map(|id| format!(" · fid {id}"))
+                                .unwrap_or_default();
+                            let format = film
+                                .format
+                                .as_deref()
+                                .map(|format| format!(" · {format}"))
+                                .unwrap_or_default();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Choose the release to use for {lookup}. “{}{year}” has {} release{}{format}{fid}.",
+                                    film.title.trim(),
+                                    film.releases.len(),
+                                    if film.releases.len() == 1 { "" } else { "s" }
+                                ))
+                                .size(12.5)
+                                .color(MUTED),
+                            );
+                            ui.add_space(8.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(470.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for (index, release) in film.releases.iter().enumerate() {
+                                        let selected = dialog.release_selected == Some(index);
+                                        if dvdcompare_release_row(ui, index, release, selected)
+                                            .clicked()
+                                        {
+                                            dialog.release_selected = Some(index);
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                });
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let selected = dialog.release_selected;
+                                if ui
+                                    .add_enabled(
+                                        selected.is_some(),
+                                        egui::Button::new(
+                                            RichText::new("Compare selected release")
+                                                .strong()
+                                                .color(INK),
+                                        )
+                                        .fill(ACCENT),
+                                    )
+                                    .clicked()
+                                    && let Some(index) = selected
+                                {
+                                    action = Some(DvdCompareAction::CompareRelease(index));
+                                }
+                                if ui.button("Choose another film").clicked() {
+                                    action = Some(DvdCompareAction::ChooseAnotherFilm);
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    action = Some(DvdCompareAction::Close);
+                                }
+                            });
+                        });
+                } else {
+                    action = Some(DvdCompareAction::Close);
+                }
+            }
+            DvdCompareState::Comparing {
+                release, changes, ..
+            } => {
+                let film = dialog.film.as_ref();
+                let film_title = film
+                    .map(|film| film.title.trim().to_string())
+                    .unwrap_or_else(|| dialog.title.clone());
+                let film_year = film
+                    .and_then(|film| film.year)
+                    .map(|year| format!(" ({year})"))
+                    .unwrap_or_default();
+                let release_year = release
+                    .year
+                    .map(|year| format!(" [{year}]"))
+                    .unwrap_or_default();
+
+                egui::Window::new("Update from DVDCompare")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(680.0)
+                    .max_height(740.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Choose which DVDCompare values to save for {lookup}. “{film_title}”{film_year} · {}{release_year}.",
+                                release.name
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Select all").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = true;
+                                }
+                            }
+                            if ui.button("Select none").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = false;
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(450.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, change) in changes.iter_mut().enumerate() {
+                                    change_row(ui, index, change, "DVDCompare");
+                                    ui.add_space(7.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let any_selected = changes.iter().any(|change| change.selected);
+                            if ui
+                                .add_enabled(
+                                    any_selected,
+                                    egui::Button::new(
+                                        RichText::new("Update movie").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                            {
+                                action = Some(DvdCompareAction::Save);
+                            }
+                            if ui.button("Choose another release").clicked() {
+                                action = Some(DvdCompareAction::ChooseAnotherRelease);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(DvdCompareAction::Close);
+                            }
+                        });
+                    });
+            }
+            DvdCompareState::Failed { message, retry } => {
+                egui::Window::new("Update from DVDCompare")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(520.0)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(message.as_str()).size(12.5).color(ERROR));
+                        ui.add_space(6.0);
+                        if matches!(*retry, DvdCompareRetry::Search) {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Title").size(12.0).color(MUTED));
+                                ui.add(
+                                    TextEdit::singleline(&mut dialog.query)
+                                        .desired_width(340.0)
+                                        .hint_text("Film title"),
+                                );
+                            });
+                            ui.add_space(6.0);
+                        }
+                        ui.label(
+                            RichText::new("Check the title, the release list, or your connection.")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Try again").clicked() {
+                                action = Some(DvdCompareAction::Retry);
+                            }
+                            if !matches!(*retry, DvdCompareRetry::Search)
+                                && !dialog.results.is_empty()
+                                && ui.button("Choose another film").clicked()
+                            {
+                                action = Some(DvdCompareAction::ChooseAnotherFilm);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(DvdCompareAction::Close);
+                            }
+                        });
+                    });
+            }
+        }
+
+        if !open && action.is_none() {
+            action = Some(DvdCompareAction::Close);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            action = Some(DvdCompareAction::Close);
+        }
+
+        match action {
+            Some(DvdCompareAction::Close) => {
+                self.dvdcompare_dialog = None;
+            }
+            Some(DvdCompareAction::Retry) => {
+                let retry = match &dialog.state {
+                    DvdCompareState::Failed { retry, .. } => *retry,
+                    _ => DvdCompareRetry::Search,
+                };
+                match retry {
+                    DvdCompareRetry::Search => self.start_dvdcompare_search(dialog),
+                    DvdCompareRetry::Film => {
+                        let result = dialog
+                            .selected
+                            .and_then(|index| dialog.results.get(index))
+                            .cloned();
+                        if let Some(result) = result {
+                            self.start_dvdcompare_film(dialog, result);
+                        } else {
+                            dialog.state = DvdCompareState::ChoosingFilm;
+                            self.dvdcompare_dialog = Some(dialog);
+                        }
+                    }
+                }
+            }
+            Some(DvdCompareAction::SearchAgain) => {
+                self.start_dvdcompare_search(dialog);
+            }
+            Some(DvdCompareAction::ChooseAnotherFilm) => {
+                dialog.state = DvdCompareState::ChoosingFilm;
+                self.dvdcompare_dialog = Some(dialog);
+            }
+            Some(DvdCompareAction::ChooseAnotherRelease) => {
+                dialog.state = DvdCompareState::ChoosingRelease;
+                self.dvdcompare_dialog = Some(dialog);
+            }
+            Some(DvdCompareAction::FetchFilm(index)) => {
+                dialog.selected = Some(index);
+                let result = dialog.results.get(index).cloned();
+                if let Some(result) = result {
+                    self.start_dvdcompare_film(dialog, result);
+                } else {
+                    self.dvdcompare_dialog = Some(dialog);
+                }
+            }
+            Some(DvdCompareAction::CompareRelease(index)) => {
+                let release = dialog
+                    .film
+                    .as_ref()
+                    .and_then(|film| film.releases.get(index))
+                    .cloned();
+                if let Some(release) = release {
+                    let Some(movie) = self.collection.find(&dialog.movie_id) else {
+                        self.status = Some(StatusMessage::error(
+                            "This movie is no longer in the collection.".to_string(),
+                        ));
+                        return;
+                    };
+                    let cuts = dialog
+                        .film
+                        .as_ref()
+                        .map(|film| film.cuts.clone())
+                        .unwrap_or_default();
+                    let details = dvdcompare::Details::from_release(&release, &cuts);
+                    let changes = details.changes(movie);
+                    dialog.release_selected = Some(index);
+                    dialog.state = DvdCompareState::Comparing {
+                        release,
+                        details: Box::new(details),
+                        changes,
+                    };
+                }
+                self.dvdcompare_dialog = Some(dialog);
+            }
+            Some(DvdCompareAction::Save) => {
+                let applied = match &dialog.state {
+                    DvdCompareState::Comparing {
+                        details, changes, ..
+                    } => {
+                        let fields: Vec<_> = changes
+                            .iter()
+                            .filter(|change| change.selected)
+                            .map(|change| change.field)
+                            .collect();
+                        let count = fields.len();
+                        self.collection.find_mut(&dialog.movie_id).map(|movie| {
+                            details.apply(movie, fields.into_iter());
+                            (movie.title.clone(), count)
+                        })
+                    }
+                    _ => None,
+                };
+                self.dvdcompare_dialog = None;
+                match applied {
+                    Some((title, count)) if count > 0 => self.commit(format!(
+                        "Updated “{title}” from DVDCompare ({count} field{}).",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    Some(_) => {
+                        self.status = Some(StatusMessage::info("No fields were selected."));
+                    }
+                    None => {
+                        self.status = Some(StatusMessage::error(
+                            "This movie is no longer in the collection.".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                self.dvdcompare_dialog = Some(dialog);
+            }
+        }
+    }
+
     fn cover_viewer_ui(&mut self, ctx: &egui::Context) {
         let Some(path) = self.cover_viewer.clone() else {
             return;
@@ -1410,6 +3398,164 @@ impl MyMoviesApp {
 
         if !open || close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.cover_viewer = None;
+        }
+    }
+
+    fn start_update_check(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(update::check_and_install());
+        });
+        self.update_dialog = Some(UpdateDialog {
+            state: UpdateState::Checking(receiver),
+        });
+    }
+
+    fn update_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.update_dialog.take() else {
+            return;
+        };
+
+        if let UpdateState::Checking(receiver) = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The update check stopped unexpectedly.".to_string()));
+                }
+            }
+            if let Some(result) = finished {
+                dialog.state = UpdateState::Finished(result);
+            }
+        }
+
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Update KinoCatalog")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                match &dialog.state {
+                    UpdateState::Checking(_) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Checking GitHub for a new release…")
+                                    .size(13.0)
+                                    .color(TEXT),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "If a newer version is available, it will be downloaded and installed.",
+                            )
+                            .size(11.5)
+                            .color(MUTED),
+                        );
+                    }
+                    UpdateState::Finished(Ok(update::Outcome::UpToDate { current, latest })) => {
+                        ui.label(
+                            RichText::new("KinoCatalog is up to date.")
+                                .size(14.0)
+                                .strong()
+                                .color(SUCCESS),
+                        );
+                        ui.add_space(4.0);
+                        let message = if current == latest {
+                            format!("Version {current} is the latest release.")
+                        } else {
+                            format!("You are running {current}; the latest release is {latest}.")
+                        };
+                        ui.label(RichText::new(message).size(12.0).color(MUTED));
+                    }
+                    UpdateState::Finished(Ok(update::Outcome::Installed {
+                        previous,
+                        installed,
+                    })) => {
+                        ui.label(
+                            RichText::new(format!("KinoCatalog {installed} has been installed."))
+                                .size(14.0)
+                                .strong()
+                                .color(SUCCESS),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Updated from {previous}. Restart the app to use the new version."
+                            ))
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                    }
+                    UpdateState::Finished(Err(message)) => {
+                        ui.label(
+                            RichText::new("Could not update KinoCatalog.")
+                                .size(14.0)
+                                .strong()
+                                .color(ERROR),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(message).size(12.0).color(TEXT)).wrap(),
+                        );
+                    }
+                }
+
+                ui.add_space(12.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+
+        if open && !close {
+            self.update_dialog = Some(dialog);
+        }
+    }
+
+    fn about_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("About")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(220.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("KinoCatalog by nowme")
+                            .size(16.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                            .size(12.5)
+                            .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if !open || close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.show_about = false;
         }
     }
 
@@ -1776,7 +3922,7 @@ impl MyMoviesApp {
     }
 }
 
-impl eframe::App for MyMoviesApp {
+impl eframe::App for KinoCatalogApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
@@ -1794,9 +3940,14 @@ impl eframe::App for MyMoviesApp {
 
         self.editor_ui(&ctx);
         self.omdb_ui(&ctx);
+        self.tmdb_ui(&ctx);
+        self.invelos_ui(&ctx);
+        self.dvdcompare_ui(&ctx);
         self.import_ui(&ctx);
         self.delete_ui(&ctx);
         self.cover_viewer_ui(&ctx);
+        self.update_ui(&ctx);
+        self.about_ui(&ctx);
     }
 }
 
@@ -1979,6 +4130,27 @@ fn variant_label(variant: &lookup::ProfileSummary, preferred: &str) -> String {
     label
 }
 
+/// Picks the variant matching the movie's own locality first, then the
+/// configured preferred locality, then the first profile.
+fn preferred_variant(variants: &[lookup::ProfileSummary], movie_locality: &str) -> usize {
+    let movie_locality = movie_locality.trim();
+    if !movie_locality.is_empty()
+        && let Some(index) = variants.iter().position(|variant| {
+            variant.locality == movie_locality
+                || lookup::locality_name(&variant.locality)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(movie_locality))
+        })
+    {
+        return index;
+    }
+
+    let preferred = lookup::locality();
+    variants
+        .iter()
+        .position(|variant| variant.locality == preferred)
+        .unwrap_or(0)
+}
+
 fn draw_lookup_row(
     ui: &mut Ui,
     editor: &mut Editor,
@@ -2119,6 +4291,15 @@ fn draw_editor(
                     );
                     ui.end_row();
 
+                    field_label(ui, "Alternative titles");
+                    ui.add(
+                        TextEdit::multiline(&mut form.alternative_titles)
+                            .desired_width(460.0)
+                            .desired_rows(2)
+                            .hint_text("One per line"),
+                    );
+                    ui.end_row();
+
                     field_label(ui, "Format");
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("format_combo")
@@ -2164,6 +4345,21 @@ fn draw_editor(
                         TextEdit::singleline(&mut form.genres)
                             .desired_width(460.0)
                             .hint_text("Comma separated, e.g. Drama, Crime"),
+                    );
+                    ui.end_row();
+
+                    field_label(
+                        ui,
+                        if form.format == DiscFormat::BluRay {
+                            "Area code"
+                        } else {
+                            "Region"
+                        },
+                    );
+                    ui.add(
+                        TextEdit::singleline(&mut form.regions)
+                            .desired_width(220.0)
+                            .hint_text("Comma separated, e.g. 1, 2 or A, B"),
                     );
                     ui.end_row();
 
@@ -2223,6 +4419,15 @@ fn draw_editor(
                         TextEdit::singleline(&mut form.case_type)
                             .desired_width(220.0)
                             .hint_text("e.g. Keep Case, Digipak"),
+                    );
+                    ui.end_row();
+
+                    field_label(ui, "Cuts");
+                    ui.add(
+                        TextEdit::multiline(&mut form.cuts)
+                            .desired_width(360.0)
+                            .desired_rows(3)
+                            .hint_text("e.g. No cuts (91:12 NTSC)"),
                     );
                     ui.end_row();
 
@@ -2321,12 +4526,7 @@ fn configure_style(ctx: &egui::Context) {
     });
 }
 
-fn movie_row(
-    ui: &mut Ui,
-    movie: &Movie,
-    selected: bool,
-    format_icons: &FormatIcons,
-) -> egui::Response {
+fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
     let fill = if selected {
         SELECTED_BG
     } else {
@@ -2342,7 +4542,7 @@ fn movie_row(
             ui.spacing_mut().item_spacing.y = 1.0;
 
             ui.horizontal(|ui| {
-                format_icon(ui, movie, format_icons);
+                format_badge(ui, movie);
                 let mut title = RichText::new(&movie.title).size(13.0);
                 if selected {
                     title = title.strong();
@@ -2371,100 +4571,6 @@ fn movie_row(
     response
 }
 
-/// Embedded format logos shown in the collection list.
-struct FormatIcons {
-    dvd: egui::TextureHandle,
-    blu_ray: egui::TextureHandle,
-    blu_ray_3d: egui::TextureHandle,
-    ultra_hd: egui::TextureHandle,
-}
-
-impl FormatIcons {
-    fn load(ctx: &egui::Context) -> Self {
-        Self {
-            dvd: load_format_texture(
-                ctx,
-                "format-dvd",
-                include_bytes!("../assets/formats/dvd.svg"),
-            ),
-            blu_ray: load_format_texture(
-                ctx,
-                "format-blu-ray",
-                include_bytes!("../assets/formats/blu-ray.svg"),
-            ),
-            blu_ray_3d: load_format_texture(
-                ctx,
-                "format-blu-ray-3d",
-                include_bytes!("../assets/formats/blu-ray-3d.svg"),
-            ),
-            ultra_hd: load_format_texture(
-                ctx,
-                "format-ultra-hd",
-                include_bytes!("../assets/formats/4k-ultra-hd.svg"),
-            ),
-        }
-    }
-
-    fn for_movie(&self, movie: &Movie) -> &egui::TextureHandle {
-        if movie.is_3d {
-            return &self.blu_ray_3d;
-        }
-
-        match movie.format {
-            DiscFormat::Dvd => &self.dvd,
-            DiscFormat::BluRay => &self.blu_ray,
-            DiscFormat::UltraHd => &self.ultra_hd,
-        }
-    }
-}
-
-fn load_format_texture(ctx: &egui::Context, name: &str, svg: &[u8]) -> egui::TextureHandle {
-    let image = rasterize_format_icon(svg);
-    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
-}
-
-/// Rasterizes an embedded SVG logo into a transparent canvas, preserving its
-/// aspect ratio and centering it. The source files use different aspect ratios,
-/// so a common canvas keeps the format badges aligned in the collection list.
-fn rasterize_format_icon(svg: &[u8]) -> egui::ColorImage {
-    const WIDTH: u32 = 176;
-    const HEIGHT: u32 = 88;
-
-    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
-        .expect("bundled format icon should parse");
-    let source = tree.size();
-    let scale = (WIDTH as f32 / source.width()).min(HEIGHT as f32 / source.height());
-    let offset_x = (WIDTH as f32 - source.width() * scale) / 2.0;
-    let offset_y = (HEIGHT as f32 - source.height() * scale) / 2.0;
-    let mut pixmap =
-        resvg::tiny_skia::Pixmap::new(WIDTH, HEIGHT).expect("format icon canvas is not empty");
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(offset_x, offset_y),
-        &mut pixmap.as_mut(),
-    );
-    egui::ColorImage::from_rgba_premultiplied([WIDTH as usize, HEIGHT as usize], pixmap.data())
-}
-
-fn format_icon(ui: &mut Ui, movie: &Movie, icons: &FormatIcons) {
-    let texture = icons.for_movie(movie);
-    egui::Frame::new()
-        .fill(FORMAT_ICON_BG)
-        .corner_radius(CornerRadius::same(3))
-        .inner_margin(Margin::symmetric(3, 1))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(
-                    texture.id(),
-                    Vec2::new(36.0, 18.0),
-                ))
-                .corner_radius(CornerRadius::same(2)),
-            );
-        })
-        .response
-        .on_hover_text(movie.format_label());
-}
-
 fn format_badge(ui: &mut Ui, movie: &Movie) {
     let (foreground, background) = match movie.format {
         DiscFormat::Dvd => (DVD_FG, DVD_BG),
@@ -2475,16 +4581,18 @@ fn format_badge(ui: &mut Ui, movie: &Movie) {
     egui::Frame::new()
         .fill(background)
         .corner_radius(CornerRadius::same(3))
-        .inner_margin(Margin::symmetric(5, 1))
+        .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.set_min_width(24.0);
+            ui.set_min_width(28.0);
             ui.label(
                 RichText::new(movie.format_badge_label())
-                    .size(9.5)
+                    .size(10.0)
                     .strong()
                     .color(foreground),
             );
-        });
+        })
+        .response
+        .on_hover_text(movie.format_label());
 }
 
 /// Toolbar button with three stacked lines that opens the action menu.
@@ -2520,24 +4628,369 @@ fn hamburger_button(ui: &mut Ui) -> egui::Response {
         .on_hover_text("Menu")
 }
 
-/// One clickable OMDb comparison row. The OMDb value is shown on the left and
-/// the movie's current value beside it. Only the OMDb side is framed, and that
-/// frame turns green when the field is selected.
-fn omdb_change_row(ui: &mut Ui, index: usize, change: &mut omdb::Change) -> egui::Response {
-    let selected = change.selected;
+/// One selectable search result in the TMDB chooser.
+fn dvdcompare_result_row(
+    ui: &mut Ui,
+    index: usize,
+    result: &dvdcompare::SearchResult,
+    selected: bool,
+) -> egui::Response {
+    let fill = if selected { SELECTED_BG } else { CARD_BG };
+    let stroke = if selected {
+        Stroke::new(1.5, ACCENT)
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+
+    let content = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    Label::new(RichText::new(&result.title).size(13.5).strong().color(TEXT)).wrap(),
+                );
+                if let Some(year) = result.year {
+                    ui.label(RichText::new(format!("({year})")).size(12.0).color(MUTED));
+                }
+                chip(ui, result.disc_format.as_deref().unwrap_or("DVD"));
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!("DVDCompare film id {}", result.film_id))
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        })
+        .response;
+
+    ui.interact(
+        content.rect,
+        ui.make_persistent_id(("dvdcompare_result", index)),
+        Sense::click(),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn dvdcompare_release_row(
+    ui: &mut Ui,
+    index: usize,
+    release: &dvdcompare::Release,
+    selected: bool,
+) -> egui::Response {
+    let fill = if selected { SELECTED_BG } else { CARD_BG };
+    let stroke = if selected {
+        Stroke::new(1.5, ACCENT)
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+
+    let content = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                Label::new(
+                    RichText::new(release.name.trim())
+                        .size(13.5)
+                        .strong()
+                        .color(TEXT),
+                )
+                .wrap(),
+            );
+            let summary = dvdcompare_release_summary(release);
+            if !summary.is_empty() {
+                ui.add_space(3.0);
+                ui.add(Label::new(RichText::new(summary).size(11.5).color(MUTED)).wrap());
+            }
+        })
+        .response;
+
+    ui.interact(
+        content.rect,
+        ui.make_persistent_id(("dvdcompare_release", index)),
+        Sense::click(),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn dvdcompare_release_summary(release: &dvdcompare::Release) -> String {
+    let mut parts = Vec::new();
+    if let Some(year) = release.year {
+        parts.push(year.to_string());
+    }
+    let discs = release.discs.len();
+    if discs > 0 {
+        parts.push(format!("{discs} disc{}", if discs == 1 { "" } else { "s" }));
+    }
+    let film_discs: Vec<String> = release
+        .discs
+        .iter()
+        .filter(|disc| disc.is_film)
+        .map(|disc| disc.number.to_string())
+        .collect();
+    if !film_discs.is_empty() {
+        parts.push(format!("film on disc {}", film_discs.join(", ")));
+    }
+    if let Some(format) = release
+        .discs
+        .iter()
+        .map(|disc| disc.format.trim())
+        .find(|format| !format.is_empty())
+    {
+        parts.push(format.to_string());
+    }
+    let extras: usize = release.discs.iter().map(|disc| disc.features.len()).sum();
+    if extras > 0 {
+        parts.push(format!(
+            "{extras} extra{}",
+            if extras == 1 { "" } else { "s" }
+        ));
+    }
+    for label in ["TV System", "Aspect Ratio", "Case type", "UPC Number"] {
+        let Some(value) = release
+            .specs
+            .get(label)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+        else {
+            continue;
+        };
+        if label == "UPC Number" {
+            parts.push(format!("UPC {value}"));
+        } else {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+fn tmdb_result_row(
+    ui: &mut Ui,
+    index: usize,
+    result: &tmdb::SearchResult,
+    selected: bool,
+) -> egui::Response {
+    let fill = if selected { SELECTED_BG } else { CARD_BG };
+    let stroke = if selected {
+        Stroke::new(1.5, ACCENT)
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+
+    let content = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&result.title).size(13.5).strong().color(TEXT));
+                if let Some(year) = result.year {
+                    ui.label(RichText::new(format!("({year})")).size(12.0).color(MUTED));
+                }
+            });
+            if !result.original_title.is_empty() && result.original_title != result.title {
+                ui.label(
+                    RichText::new(format!("Original title: {}", result.original_title))
+                        .size(11.0)
+                        .italics()
+                        .color(MUTED),
+                );
+            }
+            let overview = preview_text(&result.overview, 220);
+            if !overview.is_empty() {
+                ui.add_space(3.0);
+                ui.add(Label::new(RichText::new(overview).size(11.5).color(MUTED)).wrap());
+            }
+        })
+        .response;
+
+    ui.interact(
+        content.rect,
+        ui.make_persistent_id(("tmdb_result", index)),
+        Sense::click(),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut preview: String = text.chars().take(max_chars).collect();
+    preview.push('…');
+    preview
+}
+
+/// Missing-metadata filters selected in the **Filter by** menu.
+#[derive(Debug, Clone, Copy, Default)]
+struct MissingFilters {
+    covers: bool,
+    year: bool,
+    original_title: bool,
+}
+
+/// Applies the collection search, format, 3D and missing-metadata filters.
+fn filter_movies(
+    collection: &Collection,
+    covers: &CoverIndex,
+    search: &str,
+    format: Option<DiscFormat>,
+    only_3d: bool,
+    missing: MissingFilters,
+) -> Vec<usize> {
+    let mut indices = collection.filter_indices(search, format, only_3d);
+    if missing.covers {
+        indices.retain(|index| covers.for_upc(&collection.movies[*index].upc).is_none());
+    }
+    if missing.year {
+        indices.retain(|index| collection.movies[*index].year.is_none_or(|year| year == 0));
+    }
+    if missing.original_title {
+        indices.retain(|index| collection.movies[*index].original_title.trim().is_empty());
+    }
+    indices
+}
+
+/// Keeps the TMDB title the user picked as an alternative title when it differs
+/// from both the title that was searched for and the movie's own title.
+fn add_picked_title(
+    details: &mut omdb::Details,
+    searched_title: &str,
+    movie_title: &str,
+    picked_title: &str,
+) {
+    let picked = picked_title.trim();
+    if picked.is_empty() {
+        return;
+    }
+
+    let matches = |title: &str| title.trim().eq_ignore_ascii_case(picked);
+    if matches(searched_title) || matches(movie_title) {
+        return;
+    }
+    if details
+        .alternative_titles
+        .iter()
+        .any(|title| matches(title))
+    {
+        return;
+    }
+
+    details.alternative_titles.insert(0, picked.to_string());
+}
+
+/// One clickable metadata comparison row. The incoming provider value is shown
+/// on the left and the movie's current value beside it. Only the provider side
+/// is framed, and that frame turns green when the field is selected.
+trait MetadataChange {
+    fn label(&self) -> &'static str;
+    fn current(&self) -> &str;
+    fn incoming(&self) -> &str;
+    fn selected(&self) -> bool;
+    fn set_selected(&mut self, selected: bool);
+}
+
+impl MetadataChange for omdb::Change {
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    fn current(&self) -> &str {
+        &self.current
+    }
+
+    fn incoming(&self) -> &str {
+        &self.incoming
+    }
+
+    fn selected(&self) -> bool {
+        self.selected
+    }
+
+    fn set_selected(&mut self, selected: bool) {
+        self.selected = selected;
+    }
+}
+
+impl MetadataChange for lookup::Change {
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    fn current(&self) -> &str {
+        &self.current
+    }
+
+    fn incoming(&self) -> &str {
+        &self.incoming
+    }
+
+    fn selected(&self) -> bool {
+        self.selected
+    }
+
+    fn set_selected(&mut self, selected: bool) {
+        self.selected = selected;
+    }
+}
+
+impl MetadataChange for dvdcompare::Change {
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    fn current(&self) -> &str {
+        &self.current
+    }
+
+    fn incoming(&self) -> &str {
+        &self.incoming
+    }
+
+    fn selected(&self) -> bool {
+        self.selected
+    }
+
+    fn set_selected(&mut self, selected: bool) {
+        self.selected = selected;
+    }
+}
+
+fn change_row<C: MetadataChange>(
+    ui: &mut Ui,
+    index: usize,
+    change: &mut C,
+    source: &str,
+) -> egui::Response {
+    let selected = change.selected();
     let content = ui
         .vertical(|ui| {
-            ui.label(RichText::new(change.label).strong().size(12.0).color(TEXT));
+            ui.label(
+                RichText::new(change.label())
+                    .strong()
+                    .size(12.0)
+                    .color(TEXT),
+            );
             ui.add_space(4.0);
             ui.columns(2, |columns| {
-                omdb_value(
+                value_box(
                     &mut columns[0],
-                    "OMDb",
-                    &change.incoming,
-                    "OMDb has no value",
+                    source,
+                    change.incoming(),
+                    "No value from the provider",
                     selected,
                 );
-                omdb_value(&mut columns[1], "Current", &change.current, "Empty", false);
+                value_box(&mut columns[1], "Current", change.current(), "Empty", false);
             });
         })
         .response;
@@ -2545,17 +4998,17 @@ fn omdb_change_row(ui: &mut Ui, index: usize, change: &mut omdb::Change) -> egui
     let response = ui
         .interact(
             content.rect,
-            ui.make_persistent_id(("omdb_change", index)),
+            ui.make_persistent_id(("metadata_change", index)),
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
     if response.clicked() {
-        change.selected = !selected;
+        change.set_selected(!selected);
     }
     response
 }
 
-fn omdb_value(ui: &mut Ui, caption: &str, value: &str, empty: &str, selected: bool) {
+fn value_box(ui: &mut Ui, caption: &str, value: &str, empty: &str, selected: bool) {
     let fill = if selected {
         Color32::from_rgb(24, 44, 34)
     } else {
@@ -2793,7 +5246,11 @@ fn letterboxd_rating_text(rating: f32) -> String {
 
 fn fact(ui: &mut Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).size(11.5).color(MUTED));
-    ui.label(RichText::new(value).size(13.0).color(TEXT));
+    ui.add(
+        egui::Label::new(RichText::new(value).size(13.0).color(TEXT))
+            .wrap()
+            .halign(Align::Min),
+    );
     ui.end_row();
 }
 
@@ -2864,6 +5321,284 @@ mod tests {
     }
 
     #[test]
+    fn editing_regions_updates_the_movie() {
+        let original = Movie {
+            id: "1".to_string(),
+            title: "Alien".to_string(),
+            regions: vec!["1".to_string(), "2".to_string()],
+            ..Default::default()
+        };
+        let mut form = MovieForm::from_movie(&original);
+        assert_eq!(form.regions, "1, 2");
+
+        form.regions = "2; 4, 4".to_string();
+        let mut movie = original.clone();
+        form.apply_to(&mut movie).unwrap();
+        assert_eq!(movie.regions, vec!["2", "4"]);
+
+        form.regions.clear();
+        form.apply_to(&mut movie).unwrap();
+        assert!(movie.regions.is_empty());
+    }
+
+    #[test]
+    fn editing_the_upc_keeps_only_digits() {
+        let original = Movie {
+            id: "1".to_string(),
+            title: "Alien".to_string(),
+            upc: "012236-047605".to_string(),
+            ..Default::default()
+        };
+        let mut form = MovieForm::from_movie(&original);
+        assert_eq!(form.upc, "012236-047605");
+
+        form.upc = " 044-007 867020 ".to_string();
+        let mut movie = original.clone();
+        form.apply_to(&mut movie).unwrap();
+        assert_eq!(movie.upc, "044007867020");
+
+        form.upc.clear();
+        form.apply_to(&mut movie).unwrap();
+        assert!(movie.upc.is_empty());
+    }
+
+    #[test]
+    fn prefers_the_variant_matching_the_movies_locality() {
+        let variant = |locality: &str, title: &str| lookup::ProfileSummary {
+            profile_id: format!("044007867020.{locality}"),
+            locality: locality.to_string(),
+            title: title.to_string(),
+            edition: String::new(),
+        };
+        let variants = vec![
+            variant("0", "United States release"),
+            variant("4", "United Kingdom release"),
+            variant("16", "Finnish release"),
+        ];
+
+        assert_eq!(preferred_variant(&variants, "United Kingdom"), 1);
+        assert_eq!(preferred_variant(&variants, "4"), 1);
+        assert_eq!(preferred_variant(&variants[..1], "Finland"), 0);
+    }
+
+    #[test]
+    fn filters_movies_with_missing_covers_years_and_original_titles() {
+        let collection = Collection {
+            version: 1,
+            movies: vec![
+                Movie {
+                    id: "1".to_string(),
+                    title: "With front".to_string(),
+                    original_title: "With front original".to_string(),
+                    upc: "111".to_string(),
+                    year: Some(1979),
+                    ..Default::default()
+                },
+                Movie {
+                    id: "2".to_string(),
+                    title: "Without covers".to_string(),
+                    upc: "222".to_string(),
+                    ..Default::default()
+                },
+                Movie {
+                    id: "3".to_string(),
+                    title: "With back".to_string(),
+                    original_title: "   ".to_string(),
+                    upc: "333".to_string(),
+                    year: Some(0),
+                    ..Default::default()
+                },
+                Movie {
+                    id: "4".to_string(),
+                    title: "No UPC".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let covers = CoverIndex::from_file_names(
+            Path::new("/covers"),
+            ["111f.jpg".to_string(), "333b.jpg".to_string()],
+        );
+        let ids = |indices: Vec<usize>| {
+            indices
+                .into_iter()
+                .map(|index| collection.movies[index].id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters::default()
+            )),
+            vec!["1", "2", "3", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters {
+                    covers: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters {
+                    year: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2", "3", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters {
+                    original_title: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2", "3", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters {
+                    covers: true,
+                    year: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters {
+                    covers: true,
+                    original_title: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "",
+                None,
+                false,
+                MissingFilters {
+                    year: true,
+                    original_title: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2", "3", "4"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "without",
+                None,
+                false,
+                MissingFilters {
+                    covers: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2"]
+        );
+        assert_eq!(
+            ids(filter_movies(
+                &collection,
+                &covers,
+                "without",
+                None,
+                false,
+                MissingFilters {
+                    original_title: true,
+                    ..Default::default()
+                }
+            )),
+            vec!["2"]
+        );
+    }
+
+    #[test]
+    fn long_fact_values_wrap_within_the_available_width() {
+        let context = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(360.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let long = "Das Schweigen der Lämmer, Le silence des agneaux, ".repeat(8);
+
+        let run = || {
+            context.run_ui(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_max_width(320.0);
+                    egui::Grid::new("fact_wrap_test")
+                        .num_columns(2)
+                        .min_col_width(105.0)
+                        .show(ui, |ui| {
+                            fact(ui, "Alternative titles", &long);
+                        });
+                });
+            })
+        };
+
+        // A new grid spends its first frame sizing itself.
+        let mut output = run();
+        output.textures_delta.clear();
+        output = run();
+
+        let rows = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                Shape::Text(text) if text.galley.text() == long => Some(text.galley.rows.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        output.textures_delta.clear();
+        assert!(rows > 1, "a long fact value should wrap onto several lines");
+    }
+
+    #[test]
     fn builds_imdb_title_links() {
         assert_eq!(
             imdb_url("tt0064116").as_deref(),
@@ -2888,7 +5623,7 @@ mod tests {
         ) {
             let mut output = context.run_ui(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    *rect = omdb_change_row(ui, 0, change).rect;
+                    *rect = change_row(ui, 0, change, "OMDb").rect;
                 });
             });
             output.textures_delta.clear();
@@ -2939,6 +5674,63 @@ mod tests {
     }
 
     #[test]
+    fn adds_a_different_picked_title_as_an_alternative() {
+        let mut details = omdb::Details {
+            alternative_titles: vec!["Le silence des agneaux".to_string()],
+            ..Default::default()
+        };
+
+        add_picked_title(
+            &mut details,
+            "Silence of the Lambs",
+            "The Silence of the Lambs",
+            "The Silence of the Lambs (1991)",
+        );
+        assert_eq!(
+            details.alternative_titles,
+            vec![
+                "The Silence of the Lambs (1991)".to_string(),
+                "Le silence des agneaux".to_string()
+            ]
+        );
+
+        // A title that matches the search query or the saved title is not added.
+        add_picked_title(
+            &mut details,
+            "Silence of the Lambs",
+            "The Silence of the Lambs",
+            "silence of the lambs",
+        );
+        add_picked_title(
+            &mut details,
+            "Silence of the Lambs",
+            "The Silence of the Lambs",
+            "The Silence of the Lambs",
+        );
+
+        // Case-insensitive duplicates of an existing alternative are not added.
+        add_picked_title(
+            &mut details,
+            "Silence of the Lambs",
+            "The Silence of the Lambs",
+            "le silence des agneaux",
+        );
+        add_picked_title(
+            &mut details,
+            "Silence of the Lambs",
+            "The Silence of the Lambs",
+            "   ",
+        );
+        assert_eq!(
+            details.alternative_titles,
+            vec![
+                "The Silence of the Lambs (1991)".to_string(),
+                "Le silence des agneaux".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn draws_one_filled_mesh_per_full_star() {
         fn mesh_count(rating: f32) -> usize {
             let context = egui::Context::default();
@@ -2957,32 +5749,5 @@ mod tests {
         assert_eq!(mesh_count(0.0), 0);
         assert_eq!(mesh_count(2.5), 3);
         assert_eq!(mesh_count(5.0), 5);
-    }
-
-    #[test]
-    fn embedded_format_icons_decode() {
-        for (name, svg) in [
-            (
-                "dvd",
-                include_bytes!("../assets/formats/dvd.svg").as_slice(),
-            ),
-            (
-                "blu-ray",
-                include_bytes!("../assets/formats/blu-ray.svg").as_slice(),
-            ),
-            (
-                "blu-ray-3d",
-                include_bytes!("../assets/formats/blu-ray-3d.svg").as_slice(),
-            ),
-            (
-                "4k-ultra-hd",
-                include_bytes!("../assets/formats/4k-ultra-hd.svg").as_slice(),
-            ),
-        ] {
-            let image = rasterize_format_icon(svg);
-            assert_eq!(image.size, [176, 88], "{name} has the wrong size");
-            let visible = image.pixels.iter().filter(|pixel| pixel.a() > 0).count();
-            assert!(visible > 500, "{name} rendered almost nothing");
-        }
     }
 }

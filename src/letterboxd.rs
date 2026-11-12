@@ -596,9 +596,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads a real Letterboxd export from MYMOVIES_LETTERBOXD_TEST_ZIP"]
+    #[ignore = "reads a real Letterboxd export from KINOCATALOG_LETTERBOXD_TEST_ZIP"]
     fn live_letterboxd_export_is_readable() {
-        let Some(path) = std::env::var_os("MYMOVIES_LETTERBOXD_TEST_ZIP") else {
+        let Some(path) = crate::storage::env_os(
+            "KINOCATALOG_LETTERBOXD_TEST_ZIP",
+            "MYMOVIES_LETTERBOXD_TEST_ZIP",
+        ) else {
             return;
         };
         let bytes = std::fs::read(path).expect("read the Letterboxd export");

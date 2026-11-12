@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use encoding_rs::WINDOWS_1252;
 use roxmltree::{Document, Node};
 
-use crate::model::{Actor, DiscFormat, Movie, sort_title_for};
+use crate::model::{Actor, DiscFormat, Movie, normalize_country, normalize_upc, sort_title_for};
 
 #[derive(Debug, Default)]
 pub struct ParsedCollection {
@@ -114,7 +114,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
     let original_title = text_of(entry, "OriginalTitle");
     let year = text_of(entry, "ProductionYear").parse::<u16>().ok();
     let profile_id = text_of(entry, "ID");
-    let upc = text_of(entry, "UPC");
+    let upc = normalize_upc(&text_of(entry, "UPC"));
     let id = if !profile_id.is_empty() {
         format!("dvdprofiler:{profile_id}")
     } else if !upc.is_empty() {
@@ -132,6 +132,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         id,
         title,
         original_title,
+        alternative_titles: Vec::new(),
         sort_title,
         format: parse_format(entry),
         is_3d: parse_3d(entry),
@@ -146,7 +147,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         studios: list_of(entry, "Studios", "Studio"),
         media_companies: list_of(entry, "MediaCompanies", "MediaCompany"),
         regions: list_of(entry, "Regions", "Region"),
-        country: text_of(entry, "CountryOfOrigin"),
+        country: normalize_country(&text_of(entry, "CountryOfOrigin")),
         locality: text_of(entry, "ID_LocalityDesc"),
         overview: clean_text(&text_of(entry, "Overview")),
         actors: parse_actors(entry),
@@ -160,6 +161,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         upc,
         collection_number: text_of(entry, "CollectionNumber"),
         case_type: text_of(entry, "CaseType"),
+        cuts: String::new(),
         location: String::new(),
         purchase_date: String::new(),
         purchase_price: String::new(),
@@ -416,6 +418,7 @@ mod tests {
         let movie = &parsed.movies[0];
         assert_eq!(movie.id, "dvdprofiler:012236047605");
         assert_eq!(movie.title, "Bad Lieutenant");
+        assert_eq!(movie.upc, "012236047605");
         assert_eq!(movie.original_title, "Bad Lieutenant");
         assert_eq!(movie.locality, "United States");
         assert_eq!(movie.format, DiscFormat::Dvd);

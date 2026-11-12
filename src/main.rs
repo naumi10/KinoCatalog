@@ -2,12 +2,15 @@
 
 mod app;
 mod covers;
+mod dvdcompare;
 mod import;
 mod letterboxd;
 mod lookup;
 mod model;
 mod omdb;
 mod storage;
+mod tmdb;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,20 +19,23 @@ use eframe::egui;
 use model::Collection;
 
 const HELP: &str = "\
-myMovies — keep track of a DVD and Blu-ray collection
+KinoCatalog — keep track of a DVD and Blu-ray collection
 
 Usage:
-  myMovies                         Start the desktop app
-  myMovies --import <file.xml>     Import a DVD Profiler export and exit
-  myMovies --import-letterboxd <file.zip>
+  KinoCatalog                      Start the desktop app
+  KinoCatalog --import <file.xml>  Import a DVD Profiler export and exit
+  KinoCatalog --import-letterboxd <file.zip>
                                    Import Letterboxd ratings and exit
-  myMovies --data <file.json>      Use a different collection file
-  myMovies --help                  Show this help
+  KinoCatalog --data <file.json>   Use a different collection file
+  KinoCatalog --help               Show this help
 
 Environment:
-  MYMOVIES_DATA                    Overrides the collection file location
-  MYMOVIES_COVERS                  Folder with front/back cover images
-  MYMOVIES_LOCALITY                Preferred Invelos locality (default: 16, Finland)
+  KINOCATALOG_DATA                 Overrides the collection file location
+  KINOCATALOG_COVERS               Folder with front/back cover images
+  KINOCATALOG_LOCALITY             Preferred Invelos locality (default: 16, Finland)
+  KINOCATALOG_INSTALL_DIR          Folder where automatic updates install the app
+
+The old MYMOVIES_* variable names are still accepted as fallbacks.
 
 The GUI can import XML with the Import button; --import is a convenience for
 scripted or headless imports. Import Letterboxd reads ratings.csv from a
@@ -38,13 +44,17 @@ and scanning; the details are filled from Invelos. If the barcode exists in
 several localities, the dialog lets you choose the correct profile.
 
 Use the menu in the top-right corner of the window for Import Letterboxd…,
-Import XML… and Add movie. The movie details have an Update from OMDB button
-that compares an OMDb entry with the saved details.
+Import XML…, Add movie, Update to new version… and About. The movie details
+have an Update from OMDB button that compares an OMDb entry with the saved
+details. Update from TMDB searches The Movie Database, lets you pick the right
+match, and then compares that entry with the saved details. Update from
+DVDCompare searches DVDCompare by title, lets you pick a film and one of its
+regional releases, and then compares disc details.
 ";
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("myMovies: {error}");
+        eprintln!("KinoCatalog: {error}");
         std::process::exit(1);
     }
 }
@@ -96,7 +106,7 @@ fn run() -> Result<(), String> {
 
     let (collection, load_error) = load_or_recover(&data_path);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("myMovies")
+        .with_title("KinoCatalog")
         .with_inner_size([1240.0, 820.0])
         .with_min_inner_size([880.0, 560.0]);
     if let Some(icon) = window_icon() {
@@ -110,10 +120,10 @@ fn run() -> Result<(), String> {
     };
 
     eframe::run_native(
-        "myMovies",
+        "KinoCatalog",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(app::MyMoviesApp::new(
+            Ok(Box::new(app::KinoCatalogApp::new(
                 cc, collection, data_path, load_error,
             )))
         }),
@@ -126,7 +136,7 @@ fn run() -> Result<(), String> {
 /// The source is 256×256, which is larger than the X11 icon property accepts
 /// comfortably, so it is scaled to a crisp 128×128.
 fn window_icon() -> Option<egui::IconData> {
-    let image = image::load_from_memory(include_bytes!("../assets/myMovies.png"))
+    let image = image::load_from_memory(include_bytes!("../assets/KinoCatalog.png"))
         .ok()?
         .to_rgba8();
     let image = image::imageops::resize(&image, 128, 128, image::imageops::FilterType::Lanczos3);
@@ -145,7 +155,7 @@ fn run_import(xml_path: &Path, data_path: &Path) -> Result<(), String> {
     let mut collection = storage::load(data_path)?;
     let total = parsed.movies.len();
     let stats = collection.merge_imported(parsed.movies);
-    storage::save(data_path, &collection)?;
+    storage::save(data_path, &mut collection)?;
 
     println!(
         "Imported {total} titles ({} added, {} updated, {} skipped) into {}",
@@ -164,7 +174,7 @@ fn run_letterboxd_import(zip_path: &Path, data_path: &Path) -> Result<(), String
 
     let mut collection = storage::load(data_path)?;
     let stats = letterboxd::apply(&mut collection, &ratings);
-    storage::save(data_path, &collection)?;
+    storage::save(data_path, &mut collection)?;
 
     println!(
         "Imported {} Letterboxd ratings ({} movies rated, {} skipped) into {}",
