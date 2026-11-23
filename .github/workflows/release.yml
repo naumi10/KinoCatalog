@@ -18,8 +18,10 @@ jobs:
             artifact_name: KinoCatalog.exe
             release_archive: KinoCatalog-windows-x64.zip
             installer_asset: KinoCatalog-windows-x64-setup.exe
+          # Build against glibc 2.35 so the binary works on older Linux
+          # distributions; ubuntu-latest links against a newer glibc.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             artifact_name: KinoCatalog
             release_archive: KinoCatalog-linux-x64.tar.gz
 
@@ -35,7 +37,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux GUI Dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
@@ -85,7 +87,7 @@ jobs:
           Move-Item (Join-Path $outputDir 'KinoCatalog-windows-x64-setup.exe') '${{ matrix.installer_asset }}'
 
       - name: Package Linux Asset
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           # Stage the release files under a single directory in the archive.
           # Keep the staging directory outside target/release, because the
