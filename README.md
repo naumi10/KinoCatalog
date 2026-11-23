@@ -23,6 +23,15 @@ cargo build --release
 The GUI uses `eframe`/`egui` with the OpenGL (glow) renderer, so no GTK
 development packages are needed.
 
+## Install on Windows
+
+[Download the Windows x64 installer](https://github.com/naumi10/KinoCatalog/releases/latest/download/KinoCatalog-windows-x64-setup.exe)
+and run it. It installs KinoCatalog for the current user without requiring
+administrator rights, adds a Start Menu shortcut, and can offer a desktop
+shortcut. A portable
+[ZIP package](https://github.com/naumi10/KinoCatalog/releases/latest/download/KinoCatalog-windows-x64.zip)
+is published alongside the installer.
+
 ## Install on Linux
 
 [Download the Linux x64 package](https://github.com/naumi10/KinoCatalog/releases/latest/download/KinoCatalog-linux-x64.tar.gz),

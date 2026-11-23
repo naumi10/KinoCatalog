@@ -17,6 +17,7 @@ jobs:
             os: windows-latest
             artifact_name: KinoCatalog.exe
             release_archive: KinoCatalog-windows-x64.zip
+            installer_asset: KinoCatalog-windows-x64-setup.exe
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: KinoCatalog
@@ -52,6 +53,37 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../${{ matrix.release_archive }} ${{ matrix.artifact_name }}
 
+      - name: Build Windows Installer
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # Tags look like v1.2.3; Inno Setup uses just the numeric version.
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Unexpected release tag '$env:RELEASE_TAG' (version '$version')."
+          }
+
+          # Inno Setup 6 is preinstalled on GitHub's Windows runners.
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            throw "Inno Setup 6 compiler (ISCC.exe) was not found."
+          }
+
+          $outputDir = Join-Path $env:RUNNER_TEMP 'KinoCatalog-installer'
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          & $iscc "/DAppVersion=`"$version`"" "/O$outputDir" 'installer\windows\KinoCatalog.iss'
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          Move-Item (Join-Path $outputDir 'KinoCatalog-windows-x64-setup.exe') '${{ matrix.installer_asset }}'
+
       - name: Package Linux Asset
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -74,5 +106,13 @@ jobs:
         with:
           files: ${{ matrix.release_archive }}
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows Installer to GitHub Release
+        if: matrix.os == 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.installer_asset }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
