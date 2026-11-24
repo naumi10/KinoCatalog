@@ -8,6 +8,7 @@ mod letterboxd;
 mod lookup;
 mod model;
 mod omdb;
+mod scanner;
 mod storage;
 mod tmdb;
 mod update;
@@ -32,6 +33,7 @@ Usage:
 Environment:
   KINOCATALOG_DATA                 Overrides the collection file location
   KINOCATALOG_COVERS               Folder with front/back cover images
+  KINOCATALOG_SANE_DEVICE          Full SANE device name (default: auto-detected)
   KINOCATALOG_LOCALITY             Preferred Invelos locality (default: 16, Finland)
   KINOCATALOG_INSTALL_DIR          Folder where automatic updates install the app
 
@@ -49,7 +51,12 @@ have an Update from OMDB button that compares an OMDb entry with the saved
 details. Update from TMDB searches The Movie Database, lets you pick the right
 match, and then compares that entry with the saved details. Update from
 DVDCompare searches DVDCompare by title, lets you pick a film and one of its
-regional releases, and then compares disc details.
+regional releases, and then compares disc details. Scan cover images scans the
+whole opened cover with SANE's scanimage command, splits it into front and back,
+rotates both upright, and opens a rectangular selection tool for each side so
+you can crop and save them one at a time. Scanned covers use the movie's UPC and
+Invelos locality in the file name, selections can be remembered per disc format,
+and saved covers are kept at or below 200 kB.
 ";
 
 fn main() {

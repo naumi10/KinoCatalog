@@ -269,34 +269,65 @@ pub fn locality() -> String {
         .unwrap_or_else(|| "16".to_string())
 }
 
+/// Invelos locality IDs seen in DVD Profiler collections and variant responses.
+const LOCALITIES: &[(&str, &str)] = &[
+    ("0", "United States"),
+    ("1", "New Zealand"),
+    ("2", "Australia"),
+    ("3", "Canada"),
+    ("4", "United Kingdom"),
+    ("5", "Germany"),
+    ("6", "China"),
+    ("8", "France"),
+    ("9", "Netherlands"),
+    ("10", "Spain"),
+    ("11", "Sweden"),
+    ("12", "Norway"),
+    ("13", "Italy"),
+    ("14", "Denmark"),
+    ("16", "Finland"),
+    ("18", "South Korea"),
+    ("21", "Hong Kong"),
+    ("23", "Brazil"),
+    ("38", "Thailand"),
+    ("40", "Austria"),
+];
+
 /// A human-readable name for an Invelos locality ID.
 ///
-/// Only IDs seen in DVD Profiler collections or variant responses are listed;
-/// unknown IDs fall back to a generic label in the UI.
+/// Unknown IDs fall back to a generic label in the UI.
 pub fn locality_name(locality: &str) -> Option<&'static str> {
-    Some(match locality {
-        "0" => "United States",
-        "1" => "New Zealand",
-        "2" => "Australia",
-        "3" => "Canada",
-        "4" => "United Kingdom",
-        "5" => "Germany",
-        "6" => "China",
-        "8" => "France",
-        "9" => "Netherlands",
-        "10" => "Spain",
-        "11" => "Sweden",
-        "12" => "Norway",
-        "13" => "Italy",
-        "14" => "Denmark",
-        "16" => "Finland",
-        "18" => "South Korea",
-        "21" => "Hong Kong",
-        "23" => "Brazil",
-        "38" => "Thailand",
-        "40" => "Austria",
-        _ => return None,
-    })
+    LOCALITIES
+        .iter()
+        .find(|(id, _)| *id == locality)
+        .map(|(_, name)| *name)
+}
+
+/// Reverse lookup used when a movie only stores the locality name.
+/// Locality 0 (United States) is written without a file-name suffix.
+pub fn locality_number_from_name(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    LOCALITIES
+        .iter()
+        .find(|(_, candidate)| candidate.eq_ignore_ascii_case(name))
+        .map(|(id, _)| *id)
+        .filter(|id| *id != "0")
+}
+
+/// Numeric locality for a movie, taken from its DVD Profiler profile ID when
+/// available and otherwise from its stored locality name.
+pub fn locality_number_for(movie: &Movie) -> Option<String> {
+    let id = movie.id.rsplit(':').next().unwrap_or(&movie.id);
+    if let Ok((_, locality)) = split_profile_id(id)
+        && locality != "0"
+        && let Ok(locality) = normalize_locality(&locality)
+    {
+        return Some(locality);
+    }
+    locality_number_from_name(&movie.locality).map(str::to_string)
 }
 
 /// Finds every locality profile that Invelos has for a barcode.
@@ -1579,6 +1610,33 @@ mod tests {
         assert_eq!(locality_name("11"), Some("Sweden"));
         assert_eq!(locality_name("16"), Some("Finland"));
         assert_eq!(locality_name("999"), None);
+        assert_eq!(locality_number_from_name("Finland"), Some("16"));
+        assert_eq!(locality_number_from_name(" sweden "), Some("11"));
+        assert_eq!(locality_number_from_name("United States"), None);
+    }
+
+    #[test]
+    fn derives_a_movies_locality_number_from_id_or_name() {
+        let from_id = Movie {
+            id: "dvdprofiler:044007867020.16".to_string(),
+            locality: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(locality_number_for(&from_id).as_deref(), Some("16"));
+
+        let from_name = Movie {
+            id: "manual:1".to_string(),
+            locality: "Sweden".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(locality_number_for(&from_name).as_deref(), Some("11"));
+
+        let unknown = Movie {
+            id: "manual:2".to_string(),
+            locality: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(locality_number_for(&unknown), None);
     }
 
     #[test]

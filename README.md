@@ -53,7 +53,8 @@ under `~/.local/bin`, and creates an application-menu shortcut.
 | `src/main.rs` | Entry point, CLI arguments, startup and corrupt-store recovery |
 | `src/app.rs` | egui interface, dialogs and app state |
 | `src/model.rs` | `Movie`, `Collection`, filtering, sorting, import merge |
-| `src/covers.rs` | Cover-image directory index and UPC matching |
+| `src/covers.rs` | Cover-image directory index, naming and UPC/locality matching |
+| `src/scanner.rs` | SANE `scanimage` scanning, cover splitting/rotation, selection cropping and 200 kB JPEG output |
 | `src/dvdcompare.rs` | Native DVDCompare search and release lookup |
 | `src/import.rs` | DVD Profiler XML decoding and parsing |
 | `src/letterboxd.rs` | Letterboxd ZIP/CSV import and rating matching |

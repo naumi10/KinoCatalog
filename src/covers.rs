@@ -14,14 +14,21 @@ impl Covers {
     }
 }
 
-/// Maps UPCs to cover images by scanning a directory.
+/// Identifies a cover by UPC and, when present, its Invelos locality ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CoverKey {
+    upc: String,
+    locality: Option<String>,
+}
+
+/// Maps UPCs and localities to cover images by scanning a directory.
 ///
 /// Files are named after the disc's UPC and suffixed with `f` or `b`, for
-/// example `012236047605f.jpg` and `012236047605b.jpg`. Multi-disc releases may
-/// add a disc suffix: `044007867020.11f.jpg`.
+/// example `012236047605f.jpg`. Locality-specific profiles include the Invelos
+/// locality ID before the side, for example `044007867020.16f.jpg`.
 #[derive(Debug, Default)]
 pub struct CoverIndex {
-    by_upc: HashMap<String, Covers>,
+    by_key: HashMap<CoverKey, Covers>,
 }
 
 impl CoverIndex {
@@ -52,12 +59,12 @@ impl CoverIndex {
         let mut names: Vec<String> = names.into_iter().collect();
         names.sort();
 
-        let mut by_upc: HashMap<String, Covers> = HashMap::new();
+        let mut by_key: HashMap<CoverKey, Covers> = HashMap::new();
         for name in names {
             let Some((key, side)) = parse_cover_name(&name) else {
                 continue;
             };
-            let covers = by_upc.entry(key).or_default();
+            let covers = by_key.entry(key).or_default();
             let slot = match side {
                 CoverSide::Front => &mut covers.front,
                 CoverSide::Back => &mut covers.back,
@@ -67,34 +74,102 @@ impl CoverIndex {
             }
         }
 
-        Self { by_upc }
+        Self { by_key }
     }
 
-    /// Looks up covers for a UPC such as `012236-047605`. Hyphens, spaces and
-    /// other separators are ignored, and leading zeroes are tolerated.
-    pub fn for_upc(&self, upc: &str) -> Option<&Covers> {
-        self.candidates(upc)
-            .find_map(|key| self.by_upc.get(&key))
-            .filter(|covers| !covers.is_empty())
-    }
+    /// Looks up covers for a movie's UPC and Invelos locality. An exact locality
+    /// match wins; a locality-free file, then any other locality, are fallbacks.
+    pub fn for_upc_and_locality(&self, upc: &str, locality: Option<&str>) -> Option<&Covers> {
+        let upcs = upc_candidates(upc);
+        let localities = locality_candidates(locality);
 
-    fn candidates<'a>(&self, upc: &'a str) -> impl Iterator<Item = String> + 'a {
-        let digits: String = upc.chars().filter(char::is_ascii_digit).collect();
-        let mut keys = Vec::with_capacity(4);
-        if !digits.is_empty() {
-            keys.push(digits.clone());
-            let trimmed = digits.trim_start_matches('0');
-            if !trimmed.is_empty() && trimmed != digits {
-                keys.push(trimmed.to_string());
-            }
-            for width in [12, 13] {
-                if digits.len() < width {
-                    keys.push(format!("{digits:0>width$}"));
+        for upc in &upcs {
+            for candidate in &localities {
+                let key = CoverKey {
+                    upc: upc.clone(),
+                    locality: candidate.clone(),
+                };
+                if let Some(covers) = self.by_key.get(&key)
+                    && !covers.is_empty()
+                {
+                    return Some(covers);
                 }
             }
         }
-        keys.into_iter()
+
+        // Preserve the old behaviour of showing some cover even when the saved
+        // locality does not match a file on disk.
+        for upc in &upcs {
+            let mut matches: Vec<(&CoverKey, &Covers)> = self
+                .by_key
+                .iter()
+                .filter(|(key, covers)| key.upc == *upc && !covers.is_empty())
+                .collect();
+            matches.sort_by(|(left, _), (right, _)| left.locality.cmp(&right.locality));
+            if let Some((_, covers)) = matches.first() {
+                return Some(*covers);
+            }
+        }
+
+        None
     }
+}
+
+fn upc_candidates(upc: &str) -> Vec<String> {
+    let digits: String = upc.chars().filter(char::is_ascii_digit).collect();
+    let mut keys = Vec::with_capacity(4);
+    if !digits.is_empty() {
+        keys.push(digits.clone());
+        let trimmed = digits.trim_start_matches('0');
+        if !trimmed.is_empty() && trimmed != digits {
+            keys.push(trimmed.to_string());
+        }
+        for width in [12, 13] {
+            if digits.len() < width {
+                keys.push(format!("{digits:0>width$}"));
+            }
+        }
+    }
+    keys
+}
+
+fn locality_candidates(locality: Option<&str>) -> Vec<Option<String>> {
+    match locality {
+        Some(value) => vec![Some(value.to_string()), None],
+        None => vec![None],
+    }
+}
+
+/// Which side of a cover disc is being stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverSide {
+    Front,
+    Back,
+}
+
+impl CoverSide {
+    /// The single-letter suffix used in conventional cover file names.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Front => "f",
+            Self::Back => "b",
+        }
+    }
+}
+
+/// Name for a scanned cover. A known locality is included, for example
+/// `044007867020.16f.jpg`; without one the conventional `012236047605f.jpg`
+/// is used.
+pub fn file_name_for(upc: &str, locality: Option<&str>, side: CoverSide) -> Result<String, String> {
+    let digits: String = upc.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return Err("This movie needs a UPC before covers can be scanned.".to_string());
+    }
+    let base = match locality {
+        Some(value) if valid_locality(value) => format!("{digits}.{value}"),
+        _ => digits,
+    };
+    Ok(format!("{base}{}.jpg", side.suffix()))
 }
 
 /// Directory that holds the cover images. `KINOCATALOG_COVERS` wins; the old
@@ -111,15 +186,9 @@ pub fn directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("covers"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoverSide {
-    Front,
-    Back,
-}
-
-/// Parses `012236047605f.jpg` or `044007867020.16_front.jpg` into its UPC key
-/// and side. Returns `None` for files that are not JPEG covers.
-fn parse_cover_name(name: &str) -> Option<(String, CoverSide)> {
+/// Parses `012236047605f.jpg` or `044007867020.16_front.jpg` into its key and
+/// side. Returns `None` for files that are not JPEG covers.
+fn parse_cover_name(name: &str) -> Option<(CoverKey, CoverSide)> {
     let lower = name.to_ascii_lowercase();
     let stem = lower
         .strip_suffix(".jpeg")
@@ -137,15 +206,33 @@ fn parse_cover_name(name: &str) -> Option<(String, CoverSide)> {
         }
     };
 
-    // Drop an optional locality or disc suffix such as `.16` in
-    // `044007867020.16f.jpg` or `044007867020.11f.jpg`.
-    let base = stem.split('.').next().unwrap_or(stem);
+    // The dotted part is the Invelos locality ID, for example `.16` in
+    // `044007867020.16f.jpg`. Files without it use locality-free matching.
+    let (base, locality) = match stem.split_once('.') {
+        Some((base, suffix)) if valid_locality(suffix) => (base, Some(suffix.to_string())),
+        Some((base, _)) => (base, None),
+        None => (stem, None),
+    };
     let digits: String = base.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() {
         return None;
     }
 
-    Some((digits, side))
+    Some((
+        CoverKey {
+            upc: digits,
+            locality,
+        },
+        side,
+    ))
+}
+
+fn valid_locality(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u16>()
+            .is_ok_and(|number| (1..=999).contains(&number))
 }
 
 #[cfg(test)]
@@ -159,10 +246,35 @@ mod tests {
         )
     }
 
+    fn covers_for<'a>(index: &'a CoverIndex, upc: &str) -> Option<&'a Covers> {
+        index.for_upc_and_locality(upc, None)
+    }
+
+    #[test]
+    fn scanned_cover_names_include_the_locality_when_known() {
+        assert_eq!(
+            file_name_for("044007-867020", Some("16"), CoverSide::Front).unwrap(),
+            "044007867020.16f.jpg"
+        );
+        assert_eq!(
+            file_name_for("044007 867020", Some("11"), CoverSide::Back).unwrap(),
+            "044007867020.11b.jpg"
+        );
+        assert_eq!(
+            file_name_for("012236-047605", None, CoverSide::Front).unwrap(),
+            "012236047605f.jpg"
+        );
+        assert_eq!(
+            file_name_for("012236 047605", Some("0"), CoverSide::Back).unwrap(),
+            "012236047605b.jpg"
+        );
+        assert!(file_name_for("---", None, CoverSide::Front).is_err());
+    }
+
     #[test]
     fn matches_hyphenated_and_plain_upcs() {
         let index = index(&["012236047605f.jpg", "012236047605b.jpg"]);
-        let covers = index.for_upc("012236-047605").unwrap();
+        let covers = covers_for(&index, "012236-047605").unwrap();
         assert_eq!(
             covers.front.as_deref(),
             Some(Path::new("/covers/012236047605f.jpg"))
@@ -174,17 +286,55 @@ mod tests {
     }
 
     #[test]
-    fn ignores_disc_suffix_when_matching() {
-        let index = index(&["044007867020.11f.jpg", "044007867020.16b.jpg"]);
-        let covers = index.for_upc("044007-867020").unwrap();
-        assert!(covers.front.is_some());
-        assert!(covers.back.is_some());
+    fn matches_locality_specific_cover_files() {
+        let index = index(&[
+            "044007867020.11f.jpg",
+            "044007867020.11b.jpg",
+            "044007867020.16f.jpg",
+            "044007867020.16b.jpg",
+        ]);
+
+        let swedish = index
+            .for_upc_and_locality("044007-867020", Some("11"))
+            .unwrap();
+        assert_eq!(
+            swedish.front.as_deref(),
+            Some(Path::new("/covers/044007867020.11f.jpg"))
+        );
+        assert_eq!(
+            swedish.back.as_deref(),
+            Some(Path::new("/covers/044007867020.11b.jpg"))
+        );
+
+        let finnish = index
+            .for_upc_and_locality("044007-867020", Some("16"))
+            .unwrap();
+        assert_eq!(
+            finnish.front.as_deref(),
+            Some(Path::new("/covers/044007867020.16f.jpg"))
+        );
+        assert_eq!(
+            finnish.back.as_deref(),
+            Some(Path::new("/covers/044007867020.16b.jpg"))
+        );
+    }
+
+    #[test]
+    fn falls_back_when_locality_has_no_matching_file() {
+        let index = index(&["3259190289994.4f.jpg", "3259190289994.4b.jpg"]);
+        let covers = index
+            .for_upc_and_locality("325919-0289994", Some("16"))
+            .unwrap();
+        assert_eq!(
+            covers.front.as_deref(),
+            Some(Path::new("/covers/3259190289994.4f.jpg"))
+        );
     }
 
     #[test]
     fn tolerates_leading_zeroes_and_case() {
         let index = index(&["012569505322F.JPG", "012569505322B.JPEG"]);
-        let covers = index.for_upc("12569505322").unwrap();
+        let covers = covers_for(&index, "12569505322").unwrap();
         assert!(covers.front.is_some());
         assert!(covers.back.is_some());
     }
@@ -192,7 +342,7 @@ mod tests {
     #[test]
     fn matches_lookup_script_cover_names() {
         let index = index(&["044007867020.16_front.jpg", "044007867020.16_back.jpg"]);
-        let covers = index.for_upc("044007-867020").unwrap();
+        let covers = covers_for(&index, "044007-867020").unwrap();
         assert_eq!(
             covers.front.as_deref(),
             Some(Path::new("/covers/044007867020.16_front.jpg"))
@@ -206,15 +356,15 @@ mod tests {
     #[test]
     fn ignores_unrelated_files_and_unknown_upcs() {
         let index = index(&["readme.txt", "cover.jpg", "012236047605.jpg", "abc.jpg"]);
-        assert!(index.for_upc("012236-047605").is_none());
-        assert!(index.for_upc("999999999999").is_none());
-        assert!(index.for_upc("").is_none());
+        assert!(covers_for(&index, "012236-047605").is_none());
+        assert!(covers_for(&index, "999999999999").is_none());
+        assert!(covers_for(&index, "").is_none());
     }
 
     #[test]
-    fn prefers_the_first_disc_variant() {
+    fn prefers_the_first_locality_when_none_is_given() {
         let index = index(&["044007867020.11f.jpg", "044007867020.16f.jpg"]);
-        let covers = index.for_upc("044007867020").unwrap();
+        let covers = covers_for(&index, "044007867020").unwrap();
         assert_eq!(
             covers.front.as_deref(),
             Some(Path::new("/covers/044007867020.11f.jpg"))

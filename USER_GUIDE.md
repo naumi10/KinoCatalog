@@ -267,20 +267,73 @@ dismiss the enlarged view.
 ## Cover images
 
 Cover images are looked up by UPC in `~/covers`. Set the `KINOCATALOG_COVERS`
-environment variable to use a different folder. The folder is expected to contain
-a front and a back scan per disc:
+environment variable to use a different folder. The dotted number in a file
+name is the Invelos locality ID (`16` = Finland, `11` = Sweden, `4` = United
+Kingdom), not a disc number:
 
 ```
-~/covers/012236047605f.jpg   front
-~/covers/012236047605b.jpg   back
+~/covers/012236047605f.jpg       front, no locality recorded
+~/covers/012236047605b.jpg       back, no locality recorded
+~/covers/044007867020.16f.jpg    Finnish front for this UPC
+~/covers/044007867020.16b.jpg    Finnish back for this UPC
 ```
 
-Multi-disc releases may add a disc suffix before the `f` or `b`, for example
-`044007867020.11f.jpg`. Covers downloaded by the barcode lookup are named
+When several releases share a UPC, the movie's locality is used to pick its own
+front and back files. Covers downloaded by the barcode lookup are named
 `044007867020.16_front.jpg` / `_back.jpg` and are matched the same way. UPCs are
 stored in the collection without hyphens or spaces, and separators in existing
 cover file names are ignored when matching. `.jpeg` is accepted as well as
 `.jpg`. If a UPC has no matching images, the covers section is omitted.
+
+### Scanning covers with SANE
+
+Cover scanning requires SANE's `scanimage` command. It is not bundled with
+KinoCatalog, and the Windows installer does not install a scanner driver. In
+practice this feature is intended for **Linux** with SANE and a supported
+scanner installed. On Windows it can only work if you separately install a SANE
+frontend with `scanimage.exe` on `PATH`; TWAIN/WIA scanners are not supported.
+
+The details pane has a **Scan cover images** button for movies with a UPC. Place
+the whole, opened cover face down on the scanner and press the button. KinoCatalog
+runs SANE's `scanimage` command with PNG output, `Color` mode, 300 dpi and a
+184 × 274 mm area — tall enough for the front and back panels one above the other.
+
+The scan is split horizontally: the **top** half is the front and the **bottom**
+half is the back. Each half is rotated **90° clockwise** so it appears upright
+in the cover viewer.
+
+The front half is shown first with a rectangular selection. The starting
+selection comes from the saved default for the movie's format when one exists;
+otherwise it excludes about **10 mm** of spine and limits the height to **150 mm**,
+matching a Blu-ray cover. Drag the corner handles to resize, drag inside the
+rectangle to move it, or drag on an empty area to draw a new selection. Choose
+**Save front** to crop and save `<UPC>.<locality>f.jpg` when the movie has a
+locality, or `<UPC>f.jpg` otherwise. The back half is then shown with
+its own selection; **Save back** writes the matching `b.jpg` file. **Reset selection**
+restores the starting rectangle, and **Discard** stops without changing the
+remaining cover. Files are written to the covers folder, replacing any files
+with those names.
+
+Check **Remember as `<format>` default** before saving to store both selections
+for that disc format (DVD, Blu-ray or 4K Ultra HD). The checkbox is pre-selected
+when a default for that format already exists. Defaults are kept in
+`settings.json` beside `movies.json` and are used as the starting rectangles for
+later scans of the same format.
+
+Saved covers are scaled to at most **500 × 700 px** and the JPEG quality is
+lowered as needed so each file stays at or below **200 kB**, matching the size
+of covers already in the collection.
+
+KinoCatalog finds the device with `scanimage -L` and prefers a `snapscan:`
+device when one is available. If auto-detection picks the wrong scanner, run
+`scanimage -L` and set `KINOCATALOG_SANE_DEVICE` to the full name it prints:
+
+```sh
+export KINOCATALOG_SANE_DEVICE='snapscan:libusb:007:003'
+```
+
+A bare `snapscan` is a backend name, not a device name. `scanimage` must be
+installed and available on `PATH`, and the scanner must be powered on.
 
 ## Collection data
 

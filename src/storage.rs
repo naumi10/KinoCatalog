@@ -2,11 +2,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::model::Collection;
+use serde::{Deserialize, Serialize};
+
+use crate::covers::CoverSide;
+use crate::model::{Collection, DiscFormat};
+use crate::scanner::CropRect;
 
 const APP_DIR: &str = "KinoCatalog";
 const LEGACY_APP_DIR: &str = "myMovies";
 const DATA_FILE: &str = "movies.json";
+const SETTINGS_FILE: &str = "settings.json";
 const OMDB_KEY_FILE: &str = "omdb_api_key";
 const TMDB_KEY_FILE: &str = "tmdb_api_key";
 
@@ -81,6 +86,154 @@ pub fn omdb_key_path(data_path: &Path) -> PathBuf {
 /// Location of the stored TMDB API key or read access token.
 pub fn tmdb_key_path(data_path: &Path) -> PathBuf {
     data_path.with_file_name(TMDB_KEY_FILE)
+}
+
+/// Location of the app's small preferences file, beside the collection.
+pub fn settings_path(data_path: &Path) -> PathBuf {
+    data_path.with_file_name(SETTINGS_FILE)
+}
+
+/// A crop stored as fractions of the preview so it survives small changes in
+/// `scanimage`'s output dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StoredCrop {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl StoredCrop {
+    pub fn from_pixels(crop: CropRect, image_width: u32, image_height: u32) -> Self {
+        let width = image_width.max(1) as f32;
+        let height = image_height.max(1) as f32;
+        Self {
+            x: crop.x as f32 / width,
+            y: crop.y as f32 / height,
+            width: crop.width as f32 / width,
+            height: crop.height as f32 / height,
+        }
+    }
+
+    pub fn to_pixels(self, image_width: u32, image_height: u32) -> CropRect {
+        let image_width = image_width.max(1);
+        let image_height = image_height.max(1);
+        let x = (self.x * image_width as f32)
+            .round()
+            .max(0.0)
+            .min((image_width - 1) as f32) as u32;
+        let y = (self.y * image_height as f32)
+            .round()
+            .max(0.0)
+            .min((image_height - 1) as f32) as u32;
+        CropRect {
+            x,
+            y,
+            width: (self.width * image_width as f32)
+                .round()
+                .max(1.0)
+                .min((image_width - x) as f32) as u32,
+            height: (self.height * image_height as f32)
+                .round()
+                .max(1.0)
+                .min((image_height - y) as f32) as u32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct CoverCropDefaults {
+    front: Option<StoredCrop>,
+    back: Option<StoredCrop>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct CoverCropSettings {
+    dvd: CoverCropDefaults,
+    bluray: CoverCropDefaults,
+    ultrahd: CoverCropDefaults,
+}
+
+impl CoverCropSettings {
+    fn for_format(&self, format: DiscFormat) -> &CoverCropDefaults {
+        match format {
+            DiscFormat::Dvd => &self.dvd,
+            DiscFormat::BluRay => &self.bluray,
+            DiscFormat::UltraHd => &self.ultrahd,
+        }
+    }
+
+    fn for_format_mut(&mut self, format: DiscFormat) -> &mut CoverCropDefaults {
+        match format {
+            DiscFormat::Dvd => &mut self.dvd,
+            DiscFormat::BluRay => &mut self.bluray,
+            DiscFormat::UltraHd => &mut self.ultrahd,
+        }
+    }
+}
+
+/// Preferences that affect how covers are scanned and saved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    cover_crops: CoverCropSettings,
+}
+
+impl AppSettings {
+    /// Saved starting crop for one side of a given disc format.
+    pub fn cover_crop(&self, format: DiscFormat, side: CoverSide) -> Option<StoredCrop> {
+        let defaults = self.cover_crops.for_format(format);
+        match side {
+            CoverSide::Front => defaults.front,
+            CoverSide::Back => defaults.back,
+        }
+    }
+
+    pub fn set_cover_crop(&mut self, format: DiscFormat, side: CoverSide, crop: StoredCrop) {
+        let defaults = self.cover_crops.for_format_mut(format);
+        match side {
+            CoverSide::Front => defaults.front = Some(crop),
+            CoverSide::Back => defaults.back = Some(crop),
+        }
+    }
+
+    /// Whether either side already has a saved default for this format.
+    pub fn has_cover_crop(&self, format: DiscFormat) -> bool {
+        let defaults = self.cover_crops.for_format(format);
+        defaults.front.is_some() || defaults.back.is_some()
+    }
+}
+
+/// Missing or damaged preferences fall back to built-in defaults rather than
+/// stopping the app from starting.
+pub fn load_settings(data_path: &Path) -> AppSettings {
+    match fs::read(settings_path(data_path)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => AppSettings::default(),
+    }
+}
+
+/// Writes preferences through a temporary file so an interrupted save cannot
+/// leave truncated settings behind.
+pub fn save_settings(data_path: &Path, settings: &AppSettings) -> Result<(), String> {
+    let path = settings_path(data_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+
+    let json = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("Could not serialize the settings: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, json)
+        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("Could not replace {}: {error}", path.display()))?;
+    Ok(())
 }
 
 /// Reads the saved OMDb API key. A missing or blank file means no key is known.
@@ -334,6 +487,71 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn saves_and_loads_per_format_cover_crops() {
+        let directory =
+            std::env::temp_dir().join(format!("kinocatalog-settings-test-{}", std::process::id()));
+        let path = directory.join("movies.json");
+        let crop = StoredCrop::from_pixels(
+            CropRect {
+                x: 118,
+                y: 0,
+                width: 1500,
+                height: 1770,
+            },
+            1618,
+            2173,
+        );
+
+        let mut settings = AppSettings::default();
+        assert!(!settings.has_cover_crop(DiscFormat::BluRay));
+        settings.set_cover_crop(DiscFormat::BluRay, CoverSide::Front, crop);
+        settings.set_cover_crop(DiscFormat::Dvd, CoverSide::Back, crop);
+        save_settings(&path, &settings).expect("save settings");
+
+        let loaded = load_settings(&path);
+        assert_eq!(settings_path(&path), directory.join(SETTINGS_FILE));
+        assert_eq!(
+            loaded.cover_crop(DiscFormat::BluRay, CoverSide::Front),
+            Some(crop)
+        );
+        assert_eq!(
+            loaded.cover_crop(DiscFormat::Dvd, CoverSide::Back),
+            Some(crop)
+        );
+        assert_eq!(loaded.cover_crop(DiscFormat::BluRay, CoverSide::Back), None);
+        assert_eq!(
+            loaded
+                .cover_crop(DiscFormat::BluRay, CoverSide::Front)
+                .unwrap()
+                .to_pixels(1618, 2173),
+            CropRect {
+                x: 118,
+                y: 0,
+                width: 1500,
+                height: 1770
+            }
+        );
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn invalid_settings_fall_back_to_defaults() {
+        let directory = std::env::temp_dir().join(format!(
+            "kinocatalog-settings-invalid-test-{}",
+            std::process::id()
+        ));
+        let path = directory.join("movies.json");
+        fs::create_dir_all(&directory).expect("create directory");
+        fs::write(settings_path(&path), b"not json").expect("write settings");
+
+        let settings = load_settings(&path);
+        assert!(!settings.has_cover_crop(DiscFormat::Dvd));
 
         let _ = fs::remove_dir_all(directory);
     }

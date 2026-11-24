@@ -1,14 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Label, Layout,
-    Margin, Rect, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, TextStyle, Ui, Vec2,
+    Margin, Rect, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, TextStyle, Ui, Vec2, pos2,
 };
 
-use crate::covers::{self, CoverIndex, Covers};
+use crate::covers::{self, CoverIndex, CoverSide, Covers};
 use crate::dvdcompare;
 use crate::import;
 use crate::letterboxd;
@@ -18,6 +18,7 @@ use crate::model::{
     split_list, split_multiline,
 };
 use crate::omdb;
+use crate::scanner;
 use crate::storage;
 use crate::tmdb;
 use crate::update;
@@ -46,6 +47,7 @@ const UHD_BG: Color32 = Color32::from_rgb(57, 44, 24);
 pub struct KinoCatalogApp {
     collection: Collection,
     data_path: PathBuf,
+    settings: storage::AppSettings,
     selected: Option<String>,
     search: String,
     format_filter: Option<DiscFormat>,
@@ -69,6 +71,7 @@ pub struct KinoCatalogApp {
     covers: CoverIndex,
     cover_textures: CoverTextures,
     cover_viewer: Option<PathBuf>,
+    cover_scan: Option<CoverScan>,
     show_about: bool,
     update_dialog: Option<UpdateDialog>,
 }
@@ -326,6 +329,45 @@ enum DvdCompareAction {
     Save,
 }
 
+/// One scan of an opened cover, from starting `scanimage` to saving both files.
+struct CoverScan {
+    id: u64,
+    upc: String,
+    locality: Option<String>,
+    format: DiscFormat,
+    remember: bool,
+    stage: CoverScanStage,
+}
+
+enum CoverScanStage {
+    Scanning {
+        receiver: Receiver<Result<scanner::ScannedSpread, String>>,
+    },
+    /// One cover at a time is shown with a rectangular crop selection.
+    Selecting {
+        spread: scanner::ScannedSpread,
+        side: CoverSide,
+        selection: Option<Rect>,
+        drag: Option<SelectionDrag>,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionHandle {
+    NorthWest,
+    NorthEast,
+    SouthWest,
+    SouthEast,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelectionDrag {
+    Move { offset: Vec2 },
+    Resize(SelectionHandle),
+    Draw { start: Vec2 },
+}
+
 struct StatusMessage {
     text: String,
     kind: StatusKind,
@@ -541,9 +583,11 @@ impl KinoCatalogApp {
 
         let omdb_key = storage::load_omdb_key(&data_path);
         let tmdb_key = storage::load_tmdb_key(&data_path);
+        let settings = storage::load_settings(&data_path);
         let mut app = Self {
             collection,
             data_path,
+            settings,
             selected: None,
             search: String::new(),
             format_filter: None,
@@ -567,6 +611,7 @@ impl KinoCatalogApp {
             covers: CoverIndex::scan(&covers::directory()),
             cover_textures: CoverTextures::default(),
             cover_viewer: None,
+            cover_scan: None,
             show_about: false,
             update_dialog: None,
         };
@@ -1039,8 +1084,13 @@ impl KinoCatalogApp {
         let mut update_tmdb = false;
         let mut update_invelos = false;
         let mut update_dvdcompare = false;
+        let mut scan_covers = false;
         let mut show_full_cast = self.show_full_cast;
-        let movie_covers = self.covers.for_upc(&movie.upc).cloned();
+        let locality = lookup::locality_number_for(&movie);
+        let movie_covers = self
+            .covers
+            .for_upc_and_locality(&movie.upc, locality.as_deref())
+            .cloned();
 
         egui::ScrollArea::vertical()
             .id_salt(format!("details_{}", movie.id))
@@ -1073,6 +1123,18 @@ impl KinoCatalogApp {
                         if ui.button("Edit").clicked() {
                             edit = true;
                         }
+                        let scan_hint = if movie.upc.trim().is_empty() {
+                            "Add a UPC to this movie before scanning covers"
+                        } else {
+                            "Scan the opened cover and split it into front/back files"
+                        };
+                        ui.add_enabled(
+                            self.cover_scan.is_none() && !movie.upc.trim().is_empty(),
+                            egui::Button::new("Scan cover images"),
+                        )
+                        .on_hover_text(scan_hint)
+                        .clicked()
+                        .then(|| scan_covers = true);
                         if ui
                             .button("Update from OMDB")
                             .on_hover_text(
@@ -1349,6 +1411,343 @@ impl KinoCatalogApp {
             self.open_dvdcompare(&movie);
             ui.ctx().request_repaint();
         }
+        if scan_covers {
+            self.start_cover_scan(&movie);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn start_cover_scan(&mut self, movie: &Movie) {
+        if self.cover_scan.is_some() {
+            self.status = Some(StatusMessage::info(
+                "A cover scan is already running.".to_string(),
+            ));
+            return;
+        }
+        if movie.upc.trim().is_empty() {
+            self.status = Some(StatusMessage::error(
+                "Add a UPC to this movie before scanning covers.".to_string(),
+            ));
+            return;
+        }
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        self.cover_scan = Some(CoverScan {
+            id,
+            upc: movie.upc.trim().to_string(),
+            locality: lookup::locality_number_for(movie),
+            format: movie.format,
+            remember: self.settings.has_cover_crop(movie.format),
+            stage: CoverScanStage::Scanning {
+                receiver: spawn_cover_scan(),
+            },
+        });
+        self.status = Some(StatusMessage::info(
+            "Place the opened cover on the scanner; scanning both halves now…".to_string(),
+        ));
+    }
+
+    /// Polls the scan worker and draws the crop-selection dialog for each side.
+    /// Keeping the worker outside the UI thread avoids freezing egui while SANE scans.
+    fn cover_scan_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut scan) = self.cover_scan.take() else {
+            return;
+        };
+
+        let mut remember = scan.remember;
+        let format = scan.format;
+        let saved_front = self.settings.cover_crop(format, CoverSide::Front);
+        let saved_back = self.settings.cover_crop(format, CoverSide::Back);
+
+        let mut finished = None;
+        if let CoverScanStage::Scanning { receiver } = &scan.stage {
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The cover scan stopped unexpectedly.".to_string()));
+                }
+            }
+        }
+
+        if let Some(result) = finished {
+            match result {
+                Ok(spread) => {
+                    scan.stage = CoverScanStage::Selecting {
+                        spread,
+                        side: CoverSide::Front,
+                        selection: None,
+                        drag: None,
+                        error: None,
+                    };
+                    self.status = Some(StatusMessage::info(
+                        "Scan complete. Select the area to save as the front cover.".to_string(),
+                    ));
+                }
+                Err(message) => {
+                    self.status = Some(StatusMessage::error(message));
+                    return;
+                }
+            }
+        }
+
+        let mut save = false;
+        let mut discard = false;
+        let mut reset = false;
+        let mut remember_crop: Option<storage::StoredCrop> = None;
+        let mut displayed_size: Option<(u32, u32)> = None;
+        let mut open = true;
+        let id = scan.id;
+        let upc = scan.upc.clone();
+        let locality = scan.locality.clone();
+        let target_name = |side: CoverSide| {
+            covers::file_name_for(&upc, locality.as_deref(), side)
+                .unwrap_or_else(|_| format!("{upc}{}.jpg", side.suffix()))
+        };
+        let textures = &mut self.cover_textures;
+        let title = match &scan.stage {
+            CoverScanStage::Scanning { .. } => "Scanning cover".to_string(),
+            CoverScanStage::Selecting {
+                side: CoverSide::Front,
+                ..
+            } => format!("Select front cover · {}", format.label()),
+            CoverScanStage::Selecting {
+                side: CoverSide::Back,
+                ..
+            } => format!("Select back cover · {}", format.label()),
+        };
+
+        // While a scan is running the close button is intentionally ineffective.
+        let mut scanning_open = true;
+        let window_open = if matches!(scan.stage, CoverScanStage::Scanning { .. }) {
+            &mut scanning_open
+        } else {
+            &mut open
+        };
+
+        egui::Window::new(title)
+            .open(window_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(460.0)
+            .show(ctx, |ui| match &mut scan.stage {
+                CoverScanStage::Scanning { .. } => {
+                    ui.label(
+                        RichText::new("Keep the opened cover still while scanimage scans it…")
+                            .size(13.0)
+                            .color(TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("This usually takes a few seconds.")
+                            .size(11.5)
+                            .color(MUTED),
+                    );
+                }
+                CoverScanStage::Selecting {
+                    spread,
+                    side,
+                    selection,
+                    drag,
+                    error,
+                } => {
+                    if let Some(error) = error {
+                        ui.label(RichText::new(error.as_str()).size(12.0).color(ERROR));
+                        ui.add_space(6.0);
+                    }
+                    ui.label(
+                        RichText::new("Drag the corners to resize, or drag inside to move.")
+                            .size(12.5)
+                            .color(TEXT),
+                    );
+                    ui.add_space(8.0);
+
+                    let bytes = spread.bytes(*side);
+                    let key = format!("scan-{id}-{}", side_label(*side));
+                    if let Some(texture) = textures.get_bytes(ctx, &key, bytes) {
+                        let [image_width, image_height] = texture.size();
+                        displayed_size = Some((image_width as u32, image_height as u32));
+                        let image_size = Vec2::new(image_width as f32, image_height as f32);
+                        if selection.is_none() {
+                            let saved = match *side {
+                                CoverSide::Front => saved_front,
+                                CoverSide::Back => saved_back,
+                            };
+                            *selection = saved
+                                .map(|crop| crop.to_pixels(image_width as u32, image_height as u32))
+                                .or_else(|| scanner::default_selection(bytes, *side).ok())
+                                .map(selection_from_crop);
+                        }
+                        if let Some(rect) = selection.as_mut() {
+                            draw_selection_editor(ui, texture, image_size, rect, drag);
+                            let crop = crop_from_selection(*rect);
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Selected area: {} × {} px",
+                                    crop.width, crop.height
+                                ))
+                                .size(11.5)
+                                .color(MUTED),
+                            );
+                        }
+                    } else {
+                        ui.label(RichText::new("Preview unavailable").size(11.5).color(MUTED));
+                    }
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("Saving as {}", target_name(*side)))
+                            .size(11.5)
+                            .color(MUTED),
+                    );
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut remember,
+                        format!("Remember as {} default", format.label()),
+                    )
+                    .on_hover_text(format!(
+                        "Use the front and back selections as the starting crops for future {} scans.",
+                        format.label()
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("Save {}", side_label(*side))).clicked() {
+                            save = true;
+                            remember_crop = displayed_size.and_then(|(width, height)| {
+                                (*selection).map(|rect| {
+                                    storage::StoredCrop::from_pixels(
+                                        crop_from_selection(rect),
+                                        width,
+                                        height,
+                                    )
+                                })
+                            });
+                        }
+                        if ui.button("Reset selection").clicked() {
+                            reset = true;
+                        }
+                        if ui.button("Discard").clicked() {
+                            discard = true;
+                        }
+                    });
+                }
+            });
+
+        scan.remember = remember;
+
+        if reset
+            && let CoverScanStage::Selecting {
+                selection,
+                drag,
+                error,
+                ..
+            } = &mut scan.stage
+        {
+            *selection = None;
+            *drag = None;
+            error.take();
+        }
+
+        if save {
+            let Some((side, crop, spread)) = (|| {
+                let CoverScanStage::Selecting {
+                    spread,
+                    side,
+                    selection,
+                    ..
+                } = &scan.stage
+                else {
+                    return None;
+                };
+                Some((*side, crop_from_selection((*selection)?), spread.clone()))
+            })() else {
+                return;
+            };
+
+            match scanner::save_cover(
+                &scan.upc,
+                scan.locality.as_deref(),
+                spread.bytes(side),
+                crop,
+                side,
+            ) {
+                Ok(_) => {
+                    self.covers = CoverIndex::scan(&covers::directory());
+                    self.list_dirty = true;
+                    self.cover_textures.clear();
+
+                    let mut default_note = String::new();
+                    let mut settings_failed = false;
+                    if remember && let Some(crop) = remember_crop {
+                        self.settings.set_cover_crop(format, side, crop);
+                        match storage::save_settings(&self.data_path, &self.settings) {
+                            Ok(()) => {
+                                default_note = format!(
+                                    " Remembered the {} selection as the {} default.",
+                                    side_label(side),
+                                    format.label()
+                                )
+                            }
+                            Err(message) => {
+                                default_note = format!(
+                                    " The cover was saved, but the {} default could not be: {message}",
+                                    format.label()
+                                );
+                                settings_failed = true;
+                            }
+                        }
+                    }
+
+                    let base = if side == CoverSide::Front {
+                        "Front saved. Now select the area for the back cover.".to_string()
+                    } else {
+                        format!("Saved front and back covers for UPC {}.", scan.upc)
+                    };
+                    let message = format!("{base}{default_note}");
+                    self.status = Some(if settings_failed {
+                        StatusMessage::error(message)
+                    } else if side == CoverSide::Back {
+                        StatusMessage::success(message)
+                    } else {
+                        StatusMessage::info(message)
+                    });
+
+                    if side == CoverSide::Front {
+                        scan.stage = CoverScanStage::Selecting {
+                            spread,
+                            side: CoverSide::Back,
+                            selection: None,
+                            drag: None,
+                            error: None,
+                        };
+                    } else {
+                        return;
+                    }
+                }
+                Err(message) => {
+                    if let CoverScanStage::Selecting { error, .. } = &mut scan.stage {
+                        *error = Some(message);
+                    }
+                    self.status = Some(StatusMessage::error(
+                        "Could not save the selected cover.".to_string(),
+                    ));
+                }
+            }
+        } else if discard || (!open && matches!(scan.stage, CoverScanStage::Selecting { .. })) {
+            self.status = Some(StatusMessage::info(
+                "Cover selection stopped. Any covers already saved were kept.".to_string(),
+            ));
+            return;
+        }
+
+        self.cover_scan = Some(scan);
     }
 
     /// Starts the OMDb workflow for a movie, asking for an API key when none
@@ -3922,6 +4321,207 @@ impl KinoCatalogApp {
     }
 }
 
+fn spawn_cover_scan() -> Receiver<Result<scanner::ScannedSpread, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(scanner::scan_spread());
+    });
+    receiver
+}
+
+fn side_label(side: CoverSide) -> &'static str {
+    match side {
+        CoverSide::Front => "front",
+        CoverSide::Back => "back",
+    }
+}
+
+fn selection_from_crop(crop: scanner::CropRect) -> Rect {
+    Rect::from_min_max(
+        pos2(crop.x as f32, crop.y as f32),
+        pos2(crop.right() as f32, crop.bottom() as f32),
+    )
+}
+
+fn crop_from_selection(rect: Rect) -> scanner::CropRect {
+    let x = rect.left().max(0.0).round() as u32;
+    let y = rect.top().max(0.0).round() as u32;
+    let right = rect.right().max(x as f32).round() as u32;
+    let bottom = rect.bottom().max(y as f32).round() as u32;
+    scanner::CropRect {
+        x,
+        y,
+        width: right.saturating_sub(x).max(1),
+        height: bottom.saturating_sub(y).max(1),
+    }
+}
+
+fn selection_handle_at(point: Vec2, rect: Rect, radius: f32) -> Option<SelectionHandle> {
+    [
+        (rect.min.to_vec2(), SelectionHandle::NorthWest),
+        (
+            Vec2::new(rect.max.x, rect.min.y),
+            SelectionHandle::NorthEast,
+        ),
+        (
+            Vec2::new(rect.min.x, rect.max.y),
+            SelectionHandle::SouthWest,
+        ),
+        (rect.max.to_vec2(), SelectionHandle::SouthEast),
+    ]
+    .into_iter()
+    .find_map(|(position, handle)| ((position - point).length() <= radius).then_some(handle))
+}
+
+fn cursor_for_handle(handle: SelectionHandle) -> CursorIcon {
+    match handle {
+        SelectionHandle::NorthWest | SelectionHandle::SouthEast => CursorIcon::ResizeNwSe,
+        SelectionHandle::NorthEast | SelectionHandle::SouthWest => CursorIcon::ResizeNeSw,
+    }
+}
+
+/// Draws an image with a movable, resizable crop rectangle. Coordinates are
+/// kept in image pixels so the same selection can be applied to the scan.
+fn draw_selection_editor(
+    ui: &mut Ui,
+    texture: egui::TextureHandle,
+    image_size: Vec2,
+    selection: &mut Rect,
+    drag: &mut Option<SelectionDrag>,
+) {
+    let max_width = ui.available_width().min(380.0);
+    let scale = max_width / image_size.x.max(1.0);
+    let display_size = Vec2::new(image_size.x * scale, image_size.y * scale);
+    let response = ui.add(
+        egui::Image::new(egui::load::SizedTexture::new(texture.id(), display_size))
+            .sense(Sense::click_and_drag())
+            .corner_radius(CornerRadius::same(6)),
+    );
+    let image_rect = response.rect;
+    let painter = ui.painter_at(image_rect);
+
+    let to_screen = |point: Vec2| image_rect.min + point * scale;
+    let to_image = |point: Vec2| (point - image_rect.min.to_vec2()) / scale;
+    let clamp = |point: Vec2| {
+        Vec2::new(
+            point.x.clamp(0.0, image_size.x),
+            point.y.clamp(0.0, image_size.y),
+        )
+    };
+
+    let screen_selection = Rect::from_min_max(
+        to_screen(selection.min.to_vec2()),
+        to_screen(selection.max.to_vec2()),
+    );
+    painter.rect_filled(
+        screen_selection,
+        4.0,
+        Color32::from_rgba_unmultiplied(101, 157, 255, 45),
+    );
+    painter.rect_stroke(
+        screen_selection,
+        4.0,
+        Stroke::new(2.0, ACCENT),
+        StrokeKind::Outside,
+    );
+
+    let handle_size = 9.0;
+    let handle_radius = handle_size / scale;
+    for (position, _) in [
+        (selection.min.to_vec2(), SelectionHandle::NorthWest),
+        (
+            Vec2::new(selection.max.x, selection.min.y),
+            SelectionHandle::NorthEast,
+        ),
+        (
+            Vec2::new(selection.min.x, selection.max.y),
+            SelectionHandle::SouthWest,
+        ),
+        (rect_max_vec(*selection), SelectionHandle::SouthEast),
+    ] {
+        let rect = Rect::from_center_size(to_screen(position), Vec2::splat(handle_size));
+        painter.rect_filled(rect, 2.0, ACCENT);
+        painter.rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.0, Color32::WHITE),
+            StrokeKind::Outside,
+        );
+    }
+
+    let pointer_image = response
+        .interact_pointer_pos()
+        .or_else(|| response.hover_pos())
+        .map(|point| clamp(to_image(point.to_vec2())));
+
+    if response.drag_started()
+        && let Some(origin) = ui.input(|input| input.pointer.press_origin())
+    {
+        let point = clamp(to_image(origin.to_vec2()));
+        if let Some(handle) = selection_handle_at(point, *selection, handle_radius) {
+            *drag = Some(SelectionDrag::Resize(handle));
+        } else if selection.contains(pos2(point.x, point.y)) {
+            *drag = Some(SelectionDrag::Move {
+                offset: selection.min.to_vec2() - point,
+            });
+        } else {
+            *selection = Rect::from_min_max(pos2(point.x, point.y), pos2(point.x, point.y));
+            *drag = Some(SelectionDrag::Draw { start: point });
+        }
+    }
+
+    if response.dragged()
+        && let Some(point) = pointer_image
+    {
+        match *drag {
+            Some(SelectionDrag::Move { offset }) => {
+                let size = selection.size();
+                let x = (point.x + offset.x).clamp(0.0, (image_size.x - size.x).max(0.0));
+                let y = (point.y + offset.y).clamp(0.0, (image_size.y - size.y).max(0.0));
+                *selection = Rect::from_min_size(pos2(x, y), size);
+            }
+            Some(SelectionDrag::Resize(handle)) => {
+                let pointer = pos2(point.x, point.y);
+                *selection = match handle {
+                    SelectionHandle::NorthWest => Rect::from_two_pos(pointer, selection.max),
+                    SelectionHandle::NorthEast => Rect::from_two_pos(
+                        pos2(selection.min.x, pointer.y),
+                        pos2(pointer.x, selection.max.y),
+                    ),
+                    SelectionHandle::SouthWest => Rect::from_two_pos(
+                        pos2(pointer.x, selection.min.y),
+                        pos2(selection.max.x, pointer.y),
+                    ),
+                    SelectionHandle::SouthEast => Rect::from_two_pos(selection.min, pointer),
+                };
+            }
+            Some(SelectionDrag::Draw { start }) => {
+                *selection = Rect::from_two_pos(pos2(start.x, start.y), pos2(point.x, point.y));
+            }
+            None => {}
+        }
+    }
+
+    if response.drag_stopped() {
+        *drag = None;
+    }
+
+    if let Some(point) = pointer_image {
+        let cursor = if let Some(handle) = selection_handle_at(point, *selection, handle_radius) {
+            cursor_for_handle(handle)
+        } else if selection.contains(pos2(point.x, point.y)) {
+            CursorIcon::Move
+        } else {
+            CursorIcon::Crosshair
+        };
+        ui.ctx().set_cursor_icon(cursor);
+    }
+}
+
+fn rect_max_vec(rect: Rect) -> Vec2 {
+    Vec2::new(rect.max.x, rect.max.y)
+}
+
 impl eframe::App for KinoCatalogApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -3945,6 +4545,7 @@ impl eframe::App for KinoCatalogApp {
         self.dvdcompare_ui(&ctx);
         self.import_ui(&ctx);
         self.delete_ui(&ctx);
+        self.cover_scan_ui(&ctx);
         self.cover_viewer_ui(&ctx);
         self.update_ui(&ctx);
         self.about_ui(&ctx);
@@ -4850,7 +5451,13 @@ fn filter_movies(
 ) -> Vec<usize> {
     let mut indices = collection.filter_indices(search, format, only_3d);
     if missing.covers {
-        indices.retain(|index| covers.for_upc(&collection.movies[*index].upc).is_none());
+        indices.retain(|index| {
+            let movie = &collection.movies[*index];
+            let locality = lookup::locality_number_for(movie);
+            covers
+                .for_upc_and_locality(&movie.upc, locality.as_deref())
+                .is_none()
+        });
     }
     if missing.year {
         indices.retain(|index| collection.movies[*index].year.is_none_or(|year| year == 0));
@@ -5101,6 +5708,39 @@ impl CoverTextures {
 
         Some(texture)
     }
+
+    /// Loads an in-memory scan preview using the same bounded texture cache.
+    fn get_bytes(
+        &mut self,
+        ctx: &egui::Context,
+        key: &str,
+        bytes: &[u8],
+    ) -> Option<egui::TextureHandle> {
+        let cache_key = PathBuf::from(key);
+        if let Some(texture) = self.textures.get(&cache_key) {
+            return Some(texture.clone());
+        }
+
+        let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+        let size = [image.width() as usize, image.height() as usize];
+        let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+        let texture = ctx.load_texture(key.to_string(), pixels, egui::TextureOptions::LINEAR);
+
+        self.textures.insert(cache_key.clone(), texture.clone());
+        self.order.push_back(cache_key);
+        while self.order.len() > 12 {
+            if let Some(oldest) = self.order.pop_front() {
+                self.textures.remove(&oldest);
+            }
+        }
+
+        Some(texture)
+    }
+
+    fn clear(&mut self) {
+        self.textures.clear();
+        self.order.clear();
+    }
 }
 
 fn draw_covers(
@@ -5280,6 +5920,77 @@ fn string_list(ui: &mut Ui, items: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_selection_round_trips_through_a_rect() {
+        let crop = scanner::CropRect {
+            x: 10,
+            y: 5,
+            width: 127,
+            height: 150,
+        };
+        assert_eq!(crop_from_selection(selection_from_crop(crop)), crop);
+    }
+
+    #[test]
+    fn stored_cover_crop_round_trips_to_pixels() {
+        let crop = scanner::CropRect {
+            x: 118,
+            y: 0,
+            width: 1500,
+            height: 1770,
+        };
+        let stored = storage::StoredCrop::from_pixels(crop, 1618, 2173);
+        assert_eq!(stored.to_pixels(1618, 2173), crop);
+
+        let mut settings = storage::AppSettings::default();
+        settings.set_cover_crop(DiscFormat::BluRay, CoverSide::Front, stored);
+        assert_eq!(
+            settings.cover_crop(DiscFormat::BluRay, CoverSide::Front),
+            Some(stored)
+        );
+        assert_eq!(settings.cover_crop(DiscFormat::Dvd, CoverSide::Front), None);
+    }
+
+    #[test]
+    fn detects_selection_corner_handles() {
+        let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(50.0, 80.0));
+        assert_eq!(
+            selection_handle_at(Vec2::new(10.0, 20.0), rect, 3.0),
+            Some(SelectionHandle::NorthWest)
+        );
+        assert_eq!(
+            selection_handle_at(Vec2::new(50.0, 80.0), rect, 3.0),
+            Some(SelectionHandle::SouthEast)
+        );
+        assert_eq!(selection_handle_at(Vec2::new(30.0, 50.0), rect, 3.0), None);
+    }
+
+    #[test]
+    fn selection_editor_draws_a_crop_overlay() {
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ctx| {
+            let texture = ctx.load_texture(
+                "selection-editor-test",
+                egui::ColorImage::new([16, 16], vec![Color32::WHITE; 16 * 16]),
+                egui::TextureOptions::LINEAR,
+            );
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut selection = Rect::from_min_max(pos2(2.0, 2.0), pos2(10.0, 12.0));
+                let mut drag = None;
+                draw_selection_editor(
+                    ui,
+                    texture,
+                    Vec2::new(16.0, 16.0),
+                    &mut selection,
+                    &mut drag,
+                );
+            });
+        });
+        let shapes = output.shapes.len();
+        output.textures_delta.clear();
+        assert!(shapes > 0);
+    }
 
     #[test]
     fn hamburger_button_draws_three_lines() {
