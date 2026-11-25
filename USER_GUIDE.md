@@ -8,12 +8,12 @@ on the right.
 
 Choose **Add movie** or press `Ctrl+N` to add a title. The title is the only
 required field. You can edit a movie's details, including its locality (release
-country), region or Blu-ray area code, and original title, in the movie form.
-Locality and original title are also imported from DVD Profiler exports and
-filled by barcode lookups; region and area code are imported from DVD Profiler
-exports. UPCs are stored as digits only, so hyphens and spaces are removed when
-a movie is edited, imported or loaded. The editor includes a 3D checkbox for
-manual and barcode-added titles.
+country), region or Blu-ray area code, original title and international title,
+in the movie form. Locality, original title and international title are also
+imported from DVD Profiler exports when present; region and area code are
+imported from DVD Profiler exports. UPCs are stored as digits only, so hyphens
+and spaces are removed when a movie is edited, imported or loaded. The editor
+includes a 3D checkbox for manual and barcode-added titles.
 
 ### Add a movie with a barcode
 
@@ -266,10 +266,11 @@ dismiss the enlarged view.
 
 ## Cover images
 
-Cover images are looked up by UPC in `~/covers`. Set the `KINOCATALOG_COVERS`
-environment variable to use a different folder. The dotted number in a file
-name is the Invelos locality ID (`16` = Finland, `11` = Sweden, `4` = United
-Kingdom), not a disc number:
+Cover images are looked up by UPC in `~/covers`, or in the folder chosen in
+**Settings**. The `KINOCATALOG_COVERS` environment variable is used only until a
+folder is saved in Settings. The dotted number in a file name is the Invelos
+locality ID (`16` = Finland, `11` = Sweden, `4` = United Kingdom), not a disc
+number:
 
 ```
 ~/covers/012236047605f.jpg       front, no locality recorded
@@ -335,6 +336,46 @@ export KINOCATALOG_SANE_DEVICE='snapscan:libusb:007:003'
 A bare `snapscan` is a backend name, not a device name. `scanimage` must be
 installed and available on `PATH`, and the scanner must be powered on.
 
+## Settings
+
+Choose **Settings** from the menu in the top-right corner. The window has a list
+of setting groups on the left and the values for the selected group on the right:
+
+- **Collection** — the folder containing `movies.json`. You can also type the
+  path to the JSON file directly.
+- **Covers** — the folder containing the front and back cover JPEGs.
+- **Title list** — rules deciding which title is shown in the left-hand movie
+  list.
+
+The folder fields have a **Browse…** button, and `~` is expanded to your home
+folder. The folder choices are stored in `KinoCatalog/locations.json` under your
+config folder (`~/.config` on Linux, `%APPDATA%` on Windows). Set
+`KINOCATALOG_CONFIG` to use a different file.
+
+### Title list rules
+
+Each rule says: if the movie's country is one of the listed countries, show a
+chosen title instead of the normal one. Separate countries with commas. Rules
+are checked in order and the first match wins. If the selected title is empty,
+the normal title is used instead.
+
+The built-in default shows the **Original title** for United States, United
+Kingdom, Australia and South Africa movies. You can edit, remove or add rules in
+Settings; the rules are saved in `settings.json` beside `movies.json`. For
+example, to show the international title for Finnish and Swedish releases, add:
+
+```
+If country is: Finland, Sweden
+Show:          International title
+```
+
+Nothing is moved or deleted. The collection at the new location is loaded at
+once, along with its own API keys and settings (cover-crop defaults and title
+list rules); those files are copied from the old location only when the new
+folder does not already have them.
+Existing covers and API keys in the old folder are left untouched. `--data` still
+overrides the saved collection folder for a single command.
+
 ## Collection data
 
 By default, the collection is stored in:
@@ -347,8 +388,9 @@ On the first start after the rename, an existing
 `~/.local/share/myMovies` collection and its saved API keys are copied to the new
 folder. The old folder is left untouched, so no data is lost.
 
-Set the `KINOCATALOG_DATA` environment variable or pass `--data <file.json>` to use
-a different file:
+Set the `KINOCATALOG_DATA` environment variable to choose a different file before
+Settings has been used, or pass `--data <file.json>` to override Settings for a
+single command:
 
 ```sh
 KINOCATALOG_DATA=/tmp/test.json cargo run

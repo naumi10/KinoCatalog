@@ -1,5 +1,22 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+/// Folder chosen in Settings. Environment variables and defaults are only used
+/// while this is unset, so a saved choice also affects scanning and downloads.
+static DIRECTORY_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn override_lock() -> &'static RwLock<Option<PathBuf>> {
+    DIRECTORY_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+/// Sets (or clears) the cover folder for the running app.
+pub fn set_directory_override(dir: Option<PathBuf>) {
+    let mut current = override_lock()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    *current = dir;
+}
 
 /// Front and back cover images for one movie.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -172,10 +189,17 @@ pub fn file_name_for(upc: &str, locality: Option<&str>, side: CoverSide) -> Resu
     Ok(format!("{base}{}.jpg", side.suffix()))
 }
 
-/// Directory that holds the cover images. `KINOCATALOG_COVERS` wins; the old
-/// `MYMOVIES_COVERS` name still works, and otherwise the `covers` folder in the
-/// user's home directory is used.
+/// Directory that holds the cover images. A folder saved in Settings wins;
+/// otherwise `KINOCATALOG_COVERS` (or the old `MYMOVIES_COVERS`) is used, and
+/// finally the `covers` folder in the user's home directory.
 pub fn directory() -> PathBuf {
+    if let Some(dir) = override_lock()
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+    {
+        return dir;
+    }
     if let Some(dir) = crate::storage::env_os("KINOCATALOG_COVERS", "MYMOVIES_COVERS") {
         return PathBuf::from(dir);
     }

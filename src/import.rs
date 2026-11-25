@@ -112,6 +112,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         return None;
     }
     let original_title = text_of(entry, "OriginalTitle");
+    let international_title = text_of(entry, "InternationalTitle");
     let year = text_of(entry, "ProductionYear").parse::<u16>().ok();
     let profile_id = text_of(entry, "ID");
     let upc = normalize_upc(&text_of(entry, "UPC"));
@@ -132,6 +133,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         id,
         title,
         original_title,
+        international_title,
         alternative_titles: Vec::new(),
         sort_title,
         format: parse_format(entry),
@@ -379,6 +381,7 @@ mod tests {
     <UPC>012236-047605</UPC>
     <Title>Bad Lieutenant</Title>
     <OriginalTitle>Bad Lieutenant</OriginalTitle>
+    <InternationalTitle>Bad Lieutenant (International Cut)</InternationalTitle>
     <SortTitle>Bad Lieutenant</SortTitle>
     <ProductionYear>1992</ProductionYear>
     <RunningTime>96</RunningTime>
@@ -420,6 +423,10 @@ mod tests {
         assert_eq!(movie.title, "Bad Lieutenant");
         assert_eq!(movie.upc, "012236047605");
         assert_eq!(movie.original_title, "Bad Lieutenant");
+        assert_eq!(
+            movie.international_title,
+            "Bad Lieutenant (International Cut)"
+        );
         assert_eq!(movie.locality, "United States");
         assert_eq!(movie.format, DiscFormat::Dvd);
         assert_eq!(movie.year, Some(1992));

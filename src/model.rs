@@ -101,6 +101,8 @@ pub struct Movie {
     #[serde(default)]
     pub original_title: String,
     #[serde(default)]
+    pub international_title: String,
+    #[serde(default)]
     pub alternative_titles: Vec<String>,
     #[serde(default)]
     pub sort_title: String,
@@ -244,6 +246,71 @@ impl Movie {
     }
 }
 
+/// Which stored title a list rule displays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListTitle {
+    #[default]
+    Title,
+    OriginalTitle,
+    InternationalTitle,
+}
+
+impl ListTitle {
+    pub const ALL: [Self; 3] = [Self::Title, Self::OriginalTitle, Self::InternationalTitle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::OriginalTitle => "Original title",
+            Self::InternationalTitle => "International title",
+        }
+    }
+
+    fn title_for(self, movie: &Movie) -> &str {
+        match self {
+            Self::Title => &movie.title,
+            Self::OriginalTitle => &movie.original_title,
+            Self::InternationalTitle => &movie.international_title,
+        }
+    }
+}
+
+/// Shows a chosen title for movies from specific countries.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TitleListRule {
+    pub countries: Vec<String>,
+    pub title: ListTitle,
+}
+
+impl TitleListRule {
+    fn matches_country(&self, country: &str) -> bool {
+        country.split(',').any(|part| {
+            let part = part.trim();
+            !part.is_empty()
+                && self
+                    .countries
+                    .iter()
+                    .any(|wanted| wanted.trim().eq_ignore_ascii_case(part))
+        })
+    }
+}
+
+/// Resolves the title shown in the left-hand movie list. The first matching
+/// rule wins; if its title is unknown the movie's normal title is used.
+pub fn list_title_for<'a>(movie: &'a Movie, rules: &[TitleListRule]) -> &'a str {
+    for rule in rules {
+        if rule.matches_country(&movie.country) {
+            let title = rule.title.title_for(movie);
+            if !title.trim().is_empty() {
+                return title;
+            }
+            break;
+        }
+    }
+    &movie.title
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     #[serde(default = "current_version")]
@@ -330,17 +397,22 @@ impl Collection {
     /// Merges freshly imported movies into the collection.
     ///
     /// Titles are matched by their stable `id`. Personal notes on an existing
-    /// entry survive a re-import of the same DVD Profiler profile.
+    /// entry survive a re-import of the same DVD Profiler profile, as does a
+    /// manually entered international title when the export does not supply one.
     pub fn merge_imported(&mut self, movies: Vec<Movie>) -> MergeStats {
         let mut stats = MergeStats::default();
         for movie in movies {
             if let Some(existing) = self.find_mut(&movie.id) {
                 let notes = std::mem::take(&mut existing.notes);
+                let international_title = std::mem::take(&mut existing.international_title);
                 let letterboxd_rating = existing.letterboxd_rating.take();
                 let imdb_id = std::mem::take(&mut existing.imdb_id);
                 *existing = movie;
                 if existing.notes.is_empty() {
                     existing.notes = notes;
+                }
+                if existing.international_title.is_empty() {
+                    existing.international_title = international_title;
                 }
                 if existing.letterboxd_rating.is_none() {
                     existing.letterboxd_rating = letterboxd_rating;
@@ -661,6 +733,7 @@ mod tests {
         let mut existing = movie("1", "The Thing", DiscFormat::BluRay, 1982);
         existing.letterboxd_rating = Some(4.5);
         existing.imdb_id = "tt0084787".to_string();
+        existing.international_title = "The Thing (International)".to_string();
         existing.notes = "Seen at the cinema".to_string();
         let mut collection = Collection {
             version: 1,
@@ -673,6 +746,30 @@ mod tests {
         assert_eq!(stats.updated, 1);
         assert_eq!(collection.movies[0].letterboxd_rating, Some(4.5));
         assert_eq!(collection.movies[0].imdb_id, "tt0084787");
+        assert_eq!(
+            collection.movies[0].international_title,
+            "The Thing (International)"
+        );
         assert_eq!(collection.movies[0].notes, "Seen at the cinema");
+    }
+
+    #[test]
+    fn list_title_rules_choose_a_title_and_fall_back_to_default() {
+        let rules = vec![TitleListRule {
+            countries: split_list("United States, United Kingdom, Australia, South Africa"),
+            title: ListTitle::OriginalTitle,
+        }];
+        let mut movie = movie("1", "The Thing", DiscFormat::BluRay, 1982);
+        movie.country = "United States".to_string();
+        movie.original_title = "The Thing (Original)".to_string();
+
+        assert_eq!(list_title_for(&movie, &rules), "The Thing (Original)");
+
+        movie.original_title.clear();
+        assert_eq!(list_title_for(&movie, &rules), "The Thing");
+
+        movie.country = "Finland".to_string();
+        movie.original_title = "The Thing (Original)".to_string();
+        assert_eq!(list_title_for(&movie, &rules), "The Thing");
     }
 }

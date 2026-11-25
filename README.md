@@ -61,7 +61,7 @@ under `~/.local/bin`, and creates an application-menu shortcut.
 | `src/lookup.rs` | Native Invelos barcode lookup and profile comparison |
 | `src/omdb.rs` | OMDb lookup and response-to-movie field mapping |
 | `src/tmdb.rs` | TMDB search, detail lookup and response-to-movie field mapping |
-| `src/storage.rs` | JSON load/save, data path and API key storage |
+| `src/storage.rs` | JSON load/save, Settings folder locations and API key storage |
 | `src/update.rs` | GitHub release check, download and in-place installation |
 
 ## Tests

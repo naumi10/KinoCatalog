@@ -31,8 +31,9 @@ Usage:
   KinoCatalog --help               Show this help
 
 Environment:
-  KINOCATALOG_DATA                 Overrides the collection file location
-  KINOCATALOG_COVERS               Folder with front/back cover images
+  KINOCATALOG_DATA                 Collection file location before Settings is used
+  KINOCATALOG_COVERS               Cover folder before Settings is used
+  KINOCATALOG_CONFIG               Custom location for the Settings file
   KINOCATALOG_SANE_DEVICE          Full SANE device name (default: auto-detected)
   KINOCATALOG_LOCALITY             Preferred Invelos locality (default: 16, Finland)
   KINOCATALOG_INSTALL_DIR          Folder where automatic updates install the app
@@ -46,10 +47,12 @@ and scanning; the details are filled from Invelos. If the barcode exists in
 several localities, the dialog lets you choose the correct profile.
 
 Use the menu in the top-right corner of the window for Import Letterboxd…,
-Import XML…, Add movie, Update to new version… and About. The movie details
-have an Update from OMDB button that compares an OMDb entry with the saved
-details. Update from TMDB searches The Movie Database, lets you pick the right
-match, and then compares that entry with the saved details. Update from
+Import XML…, Add movie, Settings, Update to new version… and About. Settings
+lets you choose the folder containing movies.json and the cover image folder.
+The movie details have an Update from OMDB button that compares an OMDb entry
+with the saved details. Update from TMDB searches The Movie Database, lets you
+pick the right match, and then compares that entry with the saved details.
+Update from
 DVDCompare searches DVDCompare by title, lets you pick a film and one of its
 regional releases, and then compares disc details. Scan cover images scans the
 whole opened cover with SANE's scanimage command, splits it into front and back,
@@ -102,7 +105,9 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let data_path = data_override.unwrap_or_else(storage::data_path);
+    let locations = storage::load_locations();
+    covers::set_directory_override(locations.covers_dir.clone());
+    let data_path = storage::resolve_data_path(data_override.as_deref(), &locations);
 
     if let Some(xml_path) = import_path {
         return run_import(&xml_path, &data_path);

@@ -14,8 +14,8 @@ use crate::import;
 use crate::letterboxd;
 use crate::lookup;
 use crate::model::{
-    Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, normalize_upc, sort_title_for,
-    split_list, split_multiline,
+    Actor, Collection, DiscFormat, ListTitle, Movie, TitleListRule, join_list, list_title_for,
+    new_manual_id, normalize_upc, sort_title_for, split_list, split_multiline,
 };
 use crate::omdb;
 use crate::scanner;
@@ -59,6 +59,7 @@ pub struct KinoCatalogApp {
     list_dirty: bool,
     editor: Option<Editor>,
     import_dialog: Option<ImportDialog>,
+    settings_dialog: Option<SettingsDialog>,
     pending_delete: Option<String>,
     status: Option<StatusMessage>,
     show_full_cast: bool,
@@ -131,6 +132,39 @@ impl Editor {
 #[derive(Default)]
 struct ImportDialog {
     path: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsSection {
+    #[default]
+    Collection,
+    Covers,
+    TitleList,
+}
+
+impl SettingsSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Collection => "Collection",
+            Self::Covers => "Covers",
+            Self::TitleList => "Title list",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct TitleRuleEdit {
+    countries: String,
+    title: ListTitle,
+}
+
+#[derive(Default)]
+struct SettingsDialog {
+    section: SettingsSection,
+    movies_dir: String,
+    covers_dir: String,
+    title_rules: Vec<TitleRuleEdit>,
     error: Option<String>,
 }
 
@@ -407,6 +441,7 @@ impl StatusMessage {
 struct MovieForm {
     title: String,
     original_title: String,
+    international_title: String,
     alternative_titles: String,
     sort_title: String,
     format: DiscFormat,
@@ -437,6 +472,7 @@ impl MovieForm {
         Self {
             title: movie.title.clone(),
             original_title: movie.original_title.clone(),
+            international_title: movie.international_title.clone(),
             alternative_titles: movie.alternative_titles.join("\n"),
             // Only a lookup supplies a different sort title; when editing, an
             // empty value keeps the existing one unless the title changes.
@@ -494,6 +530,7 @@ impl MovieForm {
 
         movie.title = title.to_string();
         movie.original_title = self.original_title.trim().to_string();
+        movie.international_title = self.international_title.trim().to_string();
         movie.alternative_titles = split_multiline(&self.alternative_titles);
         movie.format = self.format;
         movie.is_3d = self.is_3d;
@@ -599,6 +636,7 @@ impl KinoCatalogApp {
             list_dirty: true,
             editor: None,
             import_dialog: None,
+            settings_dialog: None,
             pending_delete: None,
             status: load_error.map(StatusMessage::error),
             show_full_cast: false,
@@ -658,6 +696,130 @@ impl KinoCatalogApp {
                 )));
             }
         }
+    }
+
+    fn open_settings(&mut self) {
+        let movies_dir = self
+            .data_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(&self.data_path);
+        self.settings_dialog = Some(SettingsDialog {
+            section: SettingsSection::Collection,
+            movies_dir: storage::display_path(movies_dir),
+            covers_dir: storage::display_path(&covers::directory()),
+            title_rules: self
+                .settings
+                .title_rules
+                .iter()
+                .map(|rule| TitleRuleEdit {
+                    countries: join_list(&rule.countries),
+                    title: rule.title,
+                })
+                .collect(),
+            error: None,
+        });
+    }
+
+    /// Writes the Title list rules beside the active collection file.
+    fn apply_title_rules(&mut self, dialog: &SettingsDialog) -> Result<(), String> {
+        self.settings.title_rules = dialog
+            .title_rules
+            .iter()
+            .map(|rule| TitleListRule {
+                countries: split_list(&rule.countries),
+                title: rule.title,
+            })
+            .collect();
+        storage::save_settings(&self.data_path, &self.settings)
+    }
+
+    /// Applies the folders from Settings. Nothing is moved or deleted: the
+    /// collection at the new location is loaded as-is, and its sibling settings
+    /// and API keys are adopted when it does not already have its own.
+    fn apply_settings(&mut self, dialog: &SettingsDialog) -> Result<String, String> {
+        let movies_text = dialog.movies_dir.trim();
+        let covers_text = dialog.covers_dir.trim();
+        if movies_text.is_empty() {
+            return Err("Enter the folder that contains movies.json.".to_string());
+        }
+        if covers_text.is_empty() {
+            return Err("Enter the folder that contains the cover images.".to_string());
+        }
+
+        let movies_input = storage::expand_user_path(movies_text);
+        let covers_dir = storage::expand_user_path(covers_text);
+        let new_data_path = if movies_input
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
+            movies_input.clone()
+        } else {
+            storage::movies_path_in(&movies_input)
+        };
+
+        if new_data_path.is_dir() {
+            return Err(format!(
+                "{} is a folder. Point Settings at movies.json or its folder.",
+                new_data_path.display()
+            ));
+        }
+        if let Some(parent) = new_data_path.parent()
+            && parent.is_file()
+        {
+            return Err(format!("{} is a file, not a folder.", parent.display()));
+        }
+        if covers_dir.is_file() {
+            return Err(format!(
+                "{} is a file, not a cover folder.",
+                covers_dir.display()
+            ));
+        }
+
+        let movies_dir = new_data_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+
+        let collection = storage::load(&new_data_path)
+            .map_err(|error| format!("Could not open that collection: {error}"))?;
+        storage::copy_sidecars(&self.data_path, &new_data_path)?;
+        let settings = storage::load_settings(&new_data_path);
+        let omdb_key = storage::load_omdb_key(&new_data_path);
+        let tmdb_key = storage::load_tmdb_key(&new_data_path);
+
+        let locations = storage::Locations {
+            movies_dir: Some(movies_dir),
+            covers_dir: Some(covers_dir.clone()),
+        };
+        storage::save_locations(&locations)?;
+
+        covers::set_directory_override(Some(covers_dir.clone()));
+        self.data_path = new_data_path;
+        self.collection = collection;
+        self.collection.sort();
+        self.settings = settings;
+        self.omdb_key = omdb_key;
+        self.tmdb_key = tmdb_key;
+        self.covers = CoverIndex::scan(&covers_dir);
+        self.cover_textures.clear();
+        self.cover_viewer = None;
+        self.cover_scan = None;
+        if self
+            .selected
+            .as_ref()
+            .is_none_or(|id| self.collection.find(id).is_none())
+        {
+            self.selected = self.collection.movies.first().map(|movie| movie.id.clone());
+        }
+        self.list_dirty = true;
+
+        Ok(format!(
+            "Using {} and covers from {}.",
+            storage::display_path(&self.data_path),
+            storage::display_path(&covers_dir)
+        ))
     }
 
     /// Parses and merges an XML file. The caller decides how to present the
@@ -788,6 +950,7 @@ impl KinoCatalogApp {
         let mut add = false;
         let mut import = false;
         let mut import_letterboxd = false;
+        let mut open_settings = false;
         let mut open_about = false;
         let mut check_updates = false;
 
@@ -839,6 +1002,14 @@ impl KinoCatalogApp {
                                 }
                                 ui.separator();
                                 if ui
+                                    .button("Settings")
+                                    .on_hover_text("Choose the movies.json and cover folders")
+                                    .clicked()
+                                {
+                                    open_settings = true;
+                                    ui.close();
+                                }
+                                if ui
                                     .button("Update to new version…")
                                     .on_hover_text(
                                         "Check GitHub for a newer release and install it",
@@ -869,6 +1040,9 @@ impl KinoCatalogApp {
         }
         if import_letterboxd {
             self.import_letterboxd();
+        }
+        if open_settings {
+            self.open_settings();
         }
         if open_about {
             self.show_about = true;
@@ -1046,7 +1220,8 @@ impl KinoCatalogApp {
                         for index in range {
                             let movie = &self.collection.movies[filtered[index]];
                             let selected = self.selected.as_deref() == Some(movie.id.as_str());
-                            if movie_row(ui, movie, selected).clicked() {
+                            let title = list_title_for(movie, &self.settings.title_rules);
+                            if movie_row(ui, movie, selected, title).clicked() {
                                 self.selected = Some(movie.id.clone());
                                 self.show_full_cast = false;
                             }
@@ -1219,6 +1394,7 @@ impl KinoCatalogApp {
                 let mut facts: Vec<(&str, String)> = vec![
                     ("Format", movie.format_label()),
                     ("Original title", movie.original_title.clone()),
+                    ("International title", movie.international_title.clone()),
                     ("Alternative titles", join_list(&movie.alternative_titles)),
                     ("Released", movie.released.clone()),
                     (
@@ -4170,6 +4346,8 @@ impl KinoCatalogApp {
             .collapsible(false)
             .resizable(false)
             .default_width(580.0)
+            .min_width(580.0)
+            .max_width(580.0)
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
@@ -4180,7 +4358,7 @@ impl KinoCatalogApp {
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 94.0).max(220.0);
+                    let width = 400.0;
                     ui.add(
                         TextEdit::singleline(&mut dialog.path)
                             .id(egui::Id::unique("import_path"))
@@ -4260,6 +4438,252 @@ impl KinoCatalogApp {
             self.import_dialog = None;
         } else {
             self.import_dialog = Some(dialog);
+        }
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.settings_dialog.take() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut browse_movies = false;
+        let mut browse_covers = false;
+        let mut remove_rule = None;
+        let mut save = false;
+        let mut cancel = false;
+
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(720.0)
+            .min_width(720.0)
+            .max_width(720.0)
+            // The first frame starts on the short Collection section. Without a
+            // fixed height egui keeps that small size when switching to Title
+            // list, which clips the Save button below the window.
+            .default_height(560.0)
+            .min_height(560.0)
+            .max_height(560.0)
+            .show(ctx, |ui| {
+                let footer_height = 62.0;
+                let content_height = (ui.available_height() - footer_height).max(120.0);
+                egui::ScrollArea::vertical()
+                    .max_height(content_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(154.0);
+                            ui.label(RichText::new("Settings").strong().size(13.0));
+                            ui.add_space(6.0);
+                            for section in [
+                                SettingsSection::Collection,
+                                SettingsSection::Covers,
+                                SettingsSection::TitleList,
+                            ] {
+                                if ui
+                                    .selectable_value(&mut dialog.section, section, section.label())
+                                    .clicked()
+                                {
+                                    dialog.error = None;
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        ui.vertical(|ui| {
+                            ui.set_min_width(520.0);
+                            match dialog.section {
+                                SettingsSection::Collection => {
+                                    ui.label(RichText::new("Collection folder").strong());
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            TextEdit::singleline(&mut dialog.movies_dir)
+                                                .id(egui::Id::unique("settings_movies_dir"))
+                                                .desired_width(400.0)
+                                                .hint_text("/path/to/collection"),
+                                        );
+                                        if ui.button("Browse…").clicked() {
+                                            browse_movies = true;
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "KinoCatalog looks for movies.json in this folder. You can also enter the JSON file path directly.",
+                                        )
+                                        .size(10.5)
+                                        .color(MUTED),
+                                    );
+                                }
+                                SettingsSection::Covers => {
+                                    ui.label(RichText::new("Covers folder").strong());
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            TextEdit::singleline(&mut dialog.covers_dir)
+                                                .id(egui::Id::unique("settings_covers_dir"))
+                                                .desired_width(400.0)
+                                                .hint_text("/path/to/covers"),
+                                        );
+                                        if ui.button("Browse…").clicked() {
+                                            browse_covers = true;
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Front and back JPEG scans are read from and saved to this folder.",
+                                        )
+                                        .size(10.5)
+                                        .color(MUTED),
+                                    );
+                                }
+                                SettingsSection::TitleList => {
+                                    ui.label(RichText::new("Title shown in the movie list").strong());
+                                    ui.label(
+                                        RichText::new(
+                                            "Rules are checked in order. The first match wins; if that title is unknown, the normal title is used.",
+                                        )
+                                        .size(10.5)
+                                        .color(MUTED),
+                                    );
+                                    ui.add_space(8.0);
+
+                                    for (index, rule) in dialog.title_rules.iter_mut().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("If country is");
+                                                    ui.add(
+                                                        TextEdit::singleline(&mut rule.countries)
+                                                            .id_salt(("title_rule_countries", index))
+                                                            .desired_width(260.0)
+                                                            .hint_text("United States, United Kingdom"),
+                                                    );
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("show");
+                                                    egui::ComboBox::from_id_salt((
+                                                        "title_rule_field",
+                                                        index,
+                                                    ))
+                                                    .selected_text(rule.title.label())
+                                                    .width(170.0)
+                                                    .show_ui(ui, |ui| {
+                                                        for field in ListTitle::ALL {
+                                                            ui.selectable_value(
+                                                                &mut rule.title,
+                                                                field,
+                                                                field.label(),
+                                                            );
+                                                        }
+                                                    });
+                                                    if ui.button("Remove").clicked() {
+                                                        remove_rule = Some(index);
+                                                    }
+                                                });
+                                                ui.separator();
+                                    }
+
+                                    if let Some(index) = remove_rule {
+                                        dialog.title_rules.remove(index);
+                                    }
+                                    if ui.button("Add rule").clicked() {
+                                        dialog.title_rules.push(TitleRuleEdit::default());
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Separate countries with commas. Example: United States, United Kingdom, Australia, South Africa → Original title.",
+                                        )
+                                        .size(10.5)
+                                        .color(MUTED),
+                                    );
+                                }
+                            }
+                        });
+                    });
+                    if let Some(error) = &dialog.error {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(error).size(12.0).color(ERROR));
+                    }
+                    });
+
+                // Keep the actions anchored to the bottom of the fixed-size
+                // window, even when the Title list rules grow taller.
+                let clip = ui.clip_rect();
+                let footer_rect = Rect::from_min_max(
+                    pos2(clip.min.x, clip.max.y - footer_height),
+                    pos2(clip.max.x, clip.max.y),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Save").strong().color(INK))
+                                    .fill(ACCENT),
+                            )
+                            .clicked()
+                        {
+                            save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if browse_movies {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Select the folder containing movies.json")
+                .pick_folder()
+            {
+                dialog.movies_dir = storage::display_path(&path);
+                dialog.error = None;
+            }
+            self.settings_dialog = Some(dialog);
+            return;
+        }
+        if browse_covers {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Select the cover image folder")
+                .pick_folder()
+            {
+                dialog.covers_dir = storage::display_path(&path);
+                dialog.error = None;
+            }
+            self.settings_dialog = Some(dialog);
+            return;
+        }
+
+        if save {
+            // Persist the rule edits even when the folder fields are invalid,
+            // so a mistyped path does not silently discard them.
+            let applied = self.apply_settings(&dialog);
+            if let Err(error) = self.apply_title_rules(&dialog) {
+                dialog.error = Some(error);
+                self.settings_dialog = Some(dialog);
+                return;
+            }
+
+            match applied {
+                Ok(message) => {
+                    self.settings_dialog = None;
+                    self.status = Some(StatusMessage::success(message));
+                }
+                Err(error) => {
+                    dialog.error = Some(error);
+                    self.settings_dialog = Some(dialog);
+                }
+            }
+            return;
+        }
+
+        if cancel || !open {
+            self.settings_dialog = None;
+        } else {
+            self.settings_dialog = Some(dialog);
         }
     }
 
@@ -4544,6 +4968,7 @@ impl eframe::App for KinoCatalogApp {
         self.invelos_ui(&ctx);
         self.dvdcompare_ui(&ctx);
         self.import_ui(&ctx);
+        self.settings_ui(&ctx);
         self.delete_ui(&ctx);
         self.cover_scan_ui(&ctx);
         self.cover_viewer_ui(&ctx);
@@ -4892,6 +5317,14 @@ fn draw_editor(
                     );
                     ui.end_row();
 
+                    field_label(ui, "International title");
+                    ui.add(
+                        TextEdit::singleline(&mut form.international_title)
+                            .desired_width(460.0)
+                            .hint_text("Optional"),
+                    );
+                    ui.end_row();
+
                     field_label(ui, "Alternative titles");
                     ui.add(
                         TextEdit::multiline(&mut form.alternative_titles)
@@ -5127,7 +5560,7 @@ fn configure_style(ctx: &egui::Context) {
     });
 }
 
-fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
+fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool, title: &str) -> egui::Response {
     let fill = if selected {
         SELECTED_BG
     } else {
@@ -5144,11 +5577,11 @@ fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
 
             ui.horizontal(|ui| {
                 format_badge(ui, movie);
-                let mut title = RichText::new(&movie.title).size(13.0);
+                let mut text = RichText::new(title).size(13.0);
                 if selected {
-                    title = title.strong();
+                    text = text.strong();
                 }
-                ui.add(Label::new(title).truncate());
+                ui.add(Label::new(text).truncate());
             });
 
             let subtitle = movie.list_subtitle();
@@ -6029,6 +6462,216 @@ mod tests {
         form.sort_title = "Custom title".to_string();
         form.apply_to(&mut movie).unwrap();
         assert_eq!(movie.sort_title, "Custom title");
+    }
+
+    #[test]
+    fn editing_the_international_title_round_trips_and_trims() {
+        let original = Movie {
+            id: "1".to_string(),
+            title: "Alien".to_string(),
+            international_title: "Alien, the Director's Cut".to_string(),
+            ..Default::default()
+        };
+        let mut form = MovieForm::from_movie(&original);
+        assert_eq!(form.international_title, "Alien, the Director's Cut");
+
+        form.international_title = "  Alien: The Director's Cut  ".to_string();
+        let mut movie = original.clone();
+        form.apply_to(&mut movie).unwrap();
+        assert_eq!(movie.international_title, "Alien: The Director's Cut");
+
+        form.international_title.clear();
+        form.apply_to(&mut movie).unwrap();
+        assert!(movie.international_title.is_empty());
+    }
+
+    fn app_for_settings_test(data_path: PathBuf) -> KinoCatalogApp {
+        KinoCatalogApp {
+            collection: Collection::default(),
+            data_path,
+            settings: storage::AppSettings::default(),
+            selected: None,
+            search: String::new(),
+            format_filter: None,
+            only_3d: false,
+            only_missing_covers: false,
+            only_missing_year: false,
+            only_missing_original_title: false,
+            filtered: Vec::new(),
+            list_dirty: false,
+            editor: None,
+            import_dialog: None,
+            settings_dialog: None,
+            pending_delete: None,
+            status: None,
+            show_full_cast: false,
+            omdb_key: None,
+            omdb_dialog: None,
+            tmdb_key: None,
+            tmdb_dialog: None,
+            invelos_dialog: None,
+            dvdcompare_dialog: None,
+            covers: CoverIndex::scan(Path::new(".")),
+            cover_textures: CoverTextures::default(),
+            cover_viewer: None,
+            cover_scan: None,
+            show_about: false,
+            update_dialog: None,
+        }
+    }
+
+    fn shape_text_center(
+        shapes: &[eframe::egui::epaint::ClippedShape],
+        wanted: &str,
+    ) -> Option<egui::Pos2> {
+        fn in_shape(shape: &Shape, wanted: &str) -> Option<egui::Pos2> {
+            match shape {
+                Shape::Vec(nested) => nested.iter().find_map(|shape| in_shape(shape, wanted)),
+                Shape::Text(text) if text.galley.job.text == wanted => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            }
+        }
+
+        shapes
+            .iter()
+            .find_map(|clipped| in_shape(&clipped.shape, wanted))
+    }
+
+    #[test]
+    fn save_button_persists_a_new_title_rule() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("kinocatalog-click-save-{nanos}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let data_path = directory.join("movies.json");
+        std::fs::write(&data_path, b"{\"version\":1,\"movies\":[]}").unwrap();
+
+        let mut app = app_for_settings_test(data_path.clone());
+        app.settings_dialog = Some(SettingsDialog {
+            section: SettingsSection::TitleList,
+            // An intentionally invalid folder keeps the test away from the
+            // user's locations.json while still exercising the Save button.
+            movies_dir: String::new(),
+            covers_dir: storage::display_path(&directory),
+            title_rules: Vec::new(),
+            error: None,
+        });
+
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 800.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let render = |app: &mut KinoCatalogApp, input: egui::RawInput| {
+            let mut output = context.run_ui(input, |ctx| app.settings_ui(ctx));
+            let buttons = (
+                shape_text_center(&output.shapes, "Add rule"),
+                shape_text_center(&output.shapes, "Save"),
+            );
+            output.textures_delta.clear();
+            buttons
+        };
+
+        // Let egui settle the window layout once before looking for widgets.
+        let mut warmup = context.run_ui(input(), |ctx| app.settings_ui(ctx));
+        warmup.textures_delta.clear();
+
+        let (add_pos, save_pos) = render(&mut app, input());
+        assert!(save_pos.is_some(), "Save button must stay visible");
+        assert_eq!(app.settings_dialog.as_ref().unwrap().title_rules.len(), 0);
+        let add_pos = add_pos.expect("Add rule button is visible");
+        let mut moved = input();
+        moved.events.push(egui::Event::PointerMoved(add_pos));
+        render(&mut app, moved);
+
+        let mut pressed = input();
+        pressed.events.push(egui::Event::PointerButton {
+            pos: add_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        render(&mut app, pressed);
+
+        let mut released = input();
+        released.events.push(egui::Event::PointerButton {
+            pos: add_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        render(&mut app, released);
+        assert_eq!(app.settings_dialog.as_ref().unwrap().title_rules.len(), 1);
+
+        let (_, save_pos) = render(&mut app, input());
+        let save_pos = save_pos.expect("Save button is visible");
+        let mut moved = input();
+        moved.events.push(egui::Event::PointerMoved(save_pos));
+        let _ = context.run_ui(moved, |ctx| app.settings_ui(ctx));
+
+        let mut pressed = input();
+        pressed.events.push(egui::Event::PointerButton {
+            pos: save_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        let _ = context.run_ui(pressed, |ctx| app.settings_ui(ctx));
+
+        let mut released = input();
+        released.events.push(egui::Event::PointerButton {
+            pos: save_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let _ = context.run_ui(released, |ctx| app.settings_ui(ctx));
+
+        let saved = storage::load_settings(&data_path);
+        assert_eq!(saved.title_rules.len(), 1);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn saving_settings_writes_the_title_rules() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("kinocatalog-save-rules-{nanos}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let data_path = directory.join("movies.json");
+        std::fs::write(&data_path, b"{\"version\":1,\"movies\":[]}").unwrap();
+
+        let mut app = app_for_settings_test(data_path.clone());
+        let dialog = SettingsDialog {
+            section: SettingsSection::TitleList,
+            movies_dir: storage::display_path(&directory),
+            covers_dir: storage::display_path(&directory),
+            title_rules: vec![TitleRuleEdit {
+                countries: "Finland, Sweden".to_string(),
+                title: ListTitle::InternationalTitle,
+            }],
+            error: None,
+        };
+        app.apply_title_rules(&dialog).unwrap();
+
+        let saved = storage::load_settings(&data_path);
+        assert_eq!(
+            saved.title_rules,
+            vec![TitleListRule {
+                countries: split_list("Finland, Sweden"),
+                title: ListTitle::InternationalTitle,
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

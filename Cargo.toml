@@ -1,6 +1,6 @@
 [package]
 name = "KinoCatalog"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A small desktop app for keeping track of a DVD and Blu-ray collection"
 

@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::covers::CoverSide;
-use crate::model::{Collection, DiscFormat};
+use crate::model::{Collection, DiscFormat, ListTitle, TitleListRule, split_list};
 use crate::scanner::CropRect;
 
 const APP_DIR: &str = "KinoCatalog";
 const LEGACY_APP_DIR: &str = "myMovies";
 const DATA_FILE: &str = "movies.json";
 const SETTINGS_FILE: &str = "settings.json";
+const LOCATIONS_FILE: &str = "locations.json";
 const OMDB_KEY_FILE: &str = "omdb_api_key";
 const TMDB_KEY_FILE: &str = "tmdb_api_key";
 
@@ -91,6 +92,139 @@ pub fn tmdb_key_path(data_path: &Path) -> PathBuf {
 /// Location of the app's small preferences file, beside the collection.
 pub fn settings_path(data_path: &Path) -> PathBuf {
     data_path.with_file_name(SETTINGS_FILE)
+}
+
+/// Collection file inside a folder chosen in Settings.
+pub fn movies_path_in(dir: &Path) -> PathBuf {
+    dir.join(DATA_FILE)
+}
+
+/// Folder-based locations configured from the Settings dialog.
+///
+/// These live in the user config directory instead of beside `movies.json`, so
+/// moving the collection does not make the app forget where it went.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Locations {
+    pub movies_dir: Option<PathBuf>,
+    pub covers_dir: Option<PathBuf>,
+}
+
+impl Locations {
+    pub fn movies_path(&self) -> Option<PathBuf> {
+        self.movies_dir.as_ref().map(|dir| movies_path_in(dir))
+    }
+}
+
+/// Location of the small file that remembers the configured folders.
+pub fn config_path() -> PathBuf {
+    if let Some(path) = env_os("KINOCATALOG_CONFIG", "MYMOVIES_CONFIG") {
+        return PathBuf::from(path);
+    }
+
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(APP_DIR).join(LOCATIONS_FILE)
+}
+
+pub fn load_locations() -> Locations {
+    fs::read(config_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_locations(locations: &Locations) -> Result<(), String> {
+    let path = config_path();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+
+    let json = serde_json::to_vec_pretty(locations)
+        .map_err(|error| format!("Could not serialize the settings: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, json)
+        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("Could not replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
+/// Chooses the collection file: command line first, then Settings, then the
+/// usual environment variable or XDG default.
+pub fn resolve_data_path(command_line: Option<&Path>, locations: &Locations) -> PathBuf {
+    if let Some(path) = command_line {
+        return path.to_path_buf();
+    }
+    if let Some(path) = locations.movies_path() {
+        return path;
+    }
+    data_path()
+}
+
+/// Copies per-collection preferences and API keys when Settings points at a
+/// different collection folder. Existing files are never overwritten.
+pub fn copy_sidecars(from_data_path: &Path, to_data_path: &Path) -> Result<(), String> {
+    if from_data_path == to_data_path {
+        return Ok(());
+    }
+
+    for path in [
+        settings_path(from_data_path),
+        omdb_key_path(from_data_path),
+        tmdb_key_path(from_data_path),
+    ] {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let target = to_data_path.with_file_name(name);
+        if !path.exists() || target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+        }
+        fs::copy(&path, &target).map_err(|error| {
+            format!(
+                "Could not copy {} to {}: {error}",
+                path.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Expands a leading `~` from a path typed into the Settings dialog.
+pub fn expand_user_path(value: &str) -> PathBuf {
+    let value = value.trim();
+    let home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+
+    if value == "~" {
+        return home();
+    }
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return home().join(rest);
+    }
+    PathBuf::from(value)
 }
 
 /// A crop stored as fractions of the preview so it survives small changes in
@@ -174,11 +308,31 @@ impl CoverCropSettings {
     }
 }
 
-/// Preferences that affect how covers are scanned and saved.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Preferences that affect cover scanning and the movie list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     cover_crops: CoverCropSettings,
+    #[serde(default = "default_title_rules")]
+    pub title_rules: Vec<TitleListRule>,
+}
+
+/// The first rule matches the common practice of listing the original title
+/// for English-speaking or Australian/South African releases.
+fn default_title_rules() -> Vec<TitleListRule> {
+    vec![TitleListRule {
+        countries: split_list("United States, United Kingdom, Australia, South Africa"),
+        title: ListTitle::OriginalTitle,
+    }]
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            cover_crops: CoverCropSettings::default(),
+            title_rules: default_title_rules(),
+        }
+    }
 }
 
 impl AppSettings {
@@ -557,6 +711,46 @@ mod tests {
     }
 
     #[test]
+    fn default_title_rules_match_the_documented_example() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.title_rules.len(), 1);
+        assert_eq!(settings.title_rules[0].title, ListTitle::OriginalTitle);
+        assert_eq!(
+            settings.title_rules[0].countries,
+            vec![
+                "United States".to_string(),
+                "United Kingdom".to_string(),
+                "Australia".to_string(),
+                "South Africa".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn title_rules_are_persisted_and_can_be_cleared() {
+        let directory = std::env::temp_dir().join(format!(
+            "kinocatalog-title-rules-test-{}",
+            std::process::id()
+        ));
+        let path = directory.join(DATA_FILE);
+
+        let mut settings = AppSettings::default();
+        settings.title_rules.clear();
+        settings.title_rules.push(TitleListRule {
+            countries: split_list("Finland, Sweden"),
+            title: ListTitle::InternationalTitle,
+        });
+        save_settings(&path, &settings).expect("save settings");
+        assert_eq!(load_settings(&path).title_rules, settings.title_rules);
+
+        settings.title_rules.clear();
+        save_settings(&path, &settings).expect("save cleared settings");
+        assert!(load_settings(&path).title_rules.is_empty());
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn copies_legacy_data_on_first_start() {
         let base =
             std::env::temp_dir().join(format!("kinocatalog-migrate-test-{}", std::process::id()));
@@ -576,6 +770,57 @@ mod tests {
         fs::write(&preferred, "new data").expect("write current data");
         migrate_legacy_data(&base, &preferred);
         assert_eq!(fs::read_to_string(&preferred).unwrap(), "new data");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn locations_resolve_collection_paths_and_expand_tilde() {
+        let dir = PathBuf::from("/tmp/kinocatalog-locations-test");
+        let locations = Locations {
+            movies_dir: Some(dir.clone()),
+            covers_dir: Some(dir.join("covers")),
+        };
+
+        assert_eq!(locations.movies_path(), Some(dir.join(DATA_FILE)));
+        assert_eq!(movies_path_in(&dir), dir.join(DATA_FILE));
+        assert_eq!(
+            resolve_data_path(Some(Path::new("/tmp/cli.json")), &locations),
+            PathBuf::from("/tmp/cli.json")
+        );
+        assert_eq!(resolve_data_path(None, &locations), dir.join(DATA_FILE));
+
+        let expanded = expand_user_path("~/films");
+        assert!(expanded.ends_with("films"));
+        assert_ne!(expanded, PathBuf::from("~/films"));
+        assert_eq!(
+            expand_user_path("  /tmp/plain  "),
+            PathBuf::from("/tmp/plain")
+        );
+    }
+
+    #[test]
+    fn copying_sidecars_does_not_overwrite_existing_files() {
+        let base =
+            std::env::temp_dir().join(format!("kinocatalog-sidecars-test-{}", std::process::id()));
+        let old = base.join("old");
+        let new = base.join("new");
+        let old_data = old.join(DATA_FILE);
+        let new_data = new.join(DATA_FILE);
+        save_settings(&old_data, &AppSettings::default()).expect("old settings");
+        save_omdb_key(&old_data, "old-key").expect("old key");
+        save_tmdb_key(&old_data, "old-token").expect("old token");
+        fs::create_dir_all(&new).expect("create new directory");
+        fs::write(new.join(OMDB_KEY_FILE), "new-key").expect("existing key");
+
+        copy_sidecars(&old_data, &new_data).expect("copy sidecars");
+
+        assert!(settings_path(&new_data).exists());
+        assert!(tmdb_key_path(&new_data).exists());
+        assert_eq!(
+            fs::read_to_string(new.join(OMDB_KEY_FILE)).unwrap(),
+            "new-key"
+        );
 
         let _ = fs::remove_dir_all(base);
     }
